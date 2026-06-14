@@ -42,6 +42,13 @@ ManualOverride manual(s_manager);
 #ifndef LITE_AP_RETRY_INTERVAL_MS
 #define LITE_AP_RETRY_INTERVAL_MS 300000u
 #endif
+// Setup-AP passphrase. The WF200 rejects start_ap with INVALID_PARAMETER (0x21)
+// when management-frame protection is requested on an OPEN network, so the AP
+// must be secured. Matches the standard OpenEVSE firmware's softAP password
+// (net_manager.cpp); 8 chars = WPA2-PSK minimum.
+#ifndef LITE_AP_PASSWORD
+#define LITE_AP_PASSWORD "openevse"
+#endif
 static bool     s_apCredsFailed = false;  // D3: only retry STA if creds existed-but-failed
 static uint32_t s_apSinceMs     = 0;      // millis() when the current AP window began
 
@@ -85,7 +92,7 @@ void setup()
     char ssid[32];
     lite_provision_ap_ssid(ESPAL.getShortId().c_str(), ssid, sizeof(ssid));
     WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
-    WiFi.softAP(ssid);                // open AP (no passphrase) for easy join
+    WiFi.softAP(ssid, LITE_AP_PASSWORD);  // WPA2 — open AP is rejected by the WF200 (see LITE_AP_PASSWORD)
     web_server_lite_set_ap_mode(true);
     s_apCredsFailed = haveCreds;      // D3: retry STA only if creds existed-but-failed
     s_apSinceMs     = millis();
@@ -145,7 +152,7 @@ void loop()
       char ssid[32];
       lite_provision_ap_ssid(ESPAL.getShortId().c_str(), ssid, sizeof(ssid));
       WiFi.softAPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
-      WiFi.softAP(ssid);
+      WiFi.softAP(ssid, LITE_AP_PASSWORD);
       s_apSinceMs = millis();           // reset the retry window
     }
   }
