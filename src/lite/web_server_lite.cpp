@@ -32,6 +32,20 @@
 
 #include "mongoose.h"
 
+#include "FreeRTOS.h"
+#include "semphr.h"
+
+// MongooseLite's vendored lwIP port (mg_lwip_*) calls mgos_lock/mgos_unlock to
+// guard the per-connection rx_chain pbuf list, shared between the lwIP tcpip
+// thread and the mongoose poll task. The lib stubs them to no-ops off-MGOS; that
+// is a single-threaded assumption that does not hold on our NO_SYS=0 lwIP and
+// double-frees a pbuf under a concurrent scan (see mongoose.c #else note). Back
+// them with a real recursive mutex (recursive: some mongoose paths nest the
+// lock). Created in web_server_lite_begin() before mg_mgr_init.
+static SemaphoreHandle_t s_mgLock = NULL;
+extern "C" void mgos_lock(void)   { if (s_mgLock) xSemaphoreTakeRecursive(s_mgLock, portMAX_DELAY); }
+extern "C" void mgos_unlock(void) { if (s_mgLock) xSemaphoreGiveRecursive(s_mgLock); }
+
 // Reported as OpenEVSE `firmware`/`version` so the HA integration shows a value.
 #ifndef LITE_FW_VERSION
 #define LITE_FW_VERSION "lite-4ws"
@@ -690,6 +704,11 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
 
   lite_config_load_divert(s_divertCfg);   // keeps defaults if the key is absent
   lite_config_load_shaper(s_shaperCfg);  // keeps defaults if the key is absent
+
+  // Back mgos_lock/unlock before the manager (and thus the lwIP port shim) exist.
+  if (!s_mgLock) {
+    s_mgLock = xSemaphoreCreateRecursiveMutex();
+  }
 
   mg_mgr_init(&s_mgr, NULL);
   // mg_bind takes (mgr, addr, handler, user_data) when MG_ENABLE_CALLBACK_USERDATA=1.

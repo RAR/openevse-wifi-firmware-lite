@@ -15000,8 +15000,16 @@ time_t mg_lwip_if_poll(struct mg_iface *iface, int timeout_ms);
 extern void mgos_lock();
 extern void mgos_unlock();
 #else
-#define mgos_lock()
-#define mgos_unlock()
+// NOT no-ops here. This vendored lwIP port (mg_lwip_*) shares the per-connection
+// rx_chain pbuf list between the lwIP tcpip thread (mg_lwip_tcp_recv_cb) and the
+// mongoose poll task (mg_lwip_if_tcp_recv); mgos_lock/unlock are the mutual
+// exclusion. Stubbing them out is only valid for single-threaded NO_SYS=1 lwIP.
+// Our lwIP runs NO_SYS=0 with a real tcpip thread, so an unlocked rx_chain
+// double-frees a pbuf (lwIP assert "pbuf_free: p->ref > 0") — a blocking
+// WiFi.scanNetworks() on the poll task widens the race to ~750 ms and it fires
+// reliably. The app provides a real recursive mutex (web_server_lite.cpp).
+extern void mgos_lock(void);
+extern void mgos_unlock(void);
 #endif
 
 static void mg_lwip_recv_common(struct mg_connection *nc, struct pbuf *p);
