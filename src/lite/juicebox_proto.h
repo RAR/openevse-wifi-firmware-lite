@@ -1,0 +1,83 @@
+#pragma once
+#include <stdint.h>
+#include <stddef.h>
+#include "lite_evse_state.h"
+
+// static constexpr (not inline constexpr): the device toolchain builds at gnu++14,
+// where `inline` variables warn. constexpr at namespace scope already has internal
+// linkage, so each TU gets its own copy — no ODR clash.
+static constexpr size_t JB_TYPE_LEN    = 2;
+static constexpr size_t JB_MAX_PAYLOAD = 80;
+
+// One decoded protocol frame: 2-char type + NUL-terminated payload.
+struct JuiceBoxFrame {
+  char     type[JB_TYPE_LEN + 1];
+  char     payload[JB_MAX_PAYLOAD + 1];
+  uint16_t len;                       // payload length
+};
+
+// Decoded $ES status fields (raw JB values, pre-normalization).
+// Field semantics per SERIAL_PROTOCOL.md §2a (static decode of THIS unit's FW 100102):
+//   state = "S" state-machine code (HEX on the wire; see JbStateCode)
+//   line  = "L" — always 00 / unused
+//   temp  = "T" — echo of the last TP-command value, NOT a temperature sensor
+//   h     = "H" — quantized control-pilot voltage bucket (J1772 connection level)
+//   amps  = "A" — live active current limit (echoes our setpoint)
+//   power = "P" — control-pilot PWM duty, NOT watts
+//   offline_limit = "F" — echo of the offline/fallback current limit (RAM 0x520),
+//                   NOT a fault and NOT frequency. Faults come from S==0x05 + $MD/$WR.
+struct JuiceBoxStatus {
+  bool valid;
+  int  state, line, temp, h, amps, power, offline_limit;
+};
+
+// $ES "S" state-machine codes. These are HEX on the wire (e.g. "S31" => 0x31).
+// Per SERIAL_PROTOCOL.md §2a jump-table walk: exactly 7 valid codes.
+enum JbStateCode {
+  JB_S_INIT      = 0x00,  // init / reset (contactor open)
+  JB_S_READY     = 0x01,  // ready — pilot setup
+  JB_S_STANDBY   = 0x02,  // standby poll
+  JB_S_FAULT     = 0x05,  // FAULT (forces contactor open) — see $MD/$WR for the code
+  JB_S_IDLE      = 0x11,  // idle / connected poll (hub state)
+  JB_S_PRECHARGE = 0x21,  // pre-charge (contactor opening toward charge)
+  JB_S_CHARGING  = 0x31,  // CHARGING (contactor closed)
+};
+
+// Split a frame body (everything AFTER the leading '$') into type + payload.
+// Handles "<TT><3hex>:<payload>" (e.g. $ES01C:...) and "<TT>:<payload>" (e.g. $MD:...).
+bool juicebox_parse_frame_body(const char *raw, size_t n, JuiceBoxFrame &out);
+
+// Incremental, framing-tolerant parser. A frame runs from a '$' to the next '$'
+// or a CR/LF terminator (whichever comes first). Resyncs on '$'. feed() returns
+// true and fills `out` exactly once per completed frame.
+class JuiceBoxParser {
+public:
+  JuiceBoxParser() : _n(0), _started(false) {}
+  bool feed(uint8_t b, JuiceBoxFrame &out);
+  void reset() { _n = 0; _started = false; }
+private:
+  bool flush(JuiceBoxFrame &out);
+  char   _raw[JB_MAX_PAYLOAD + 16];
+  size_t _n;
+  bool   _started;
+};
+
+// Decode a $ES payload (e.g. "S00,L00,T00,H00,A00,P000,F00") into JuiceBoxStatus.
+bool juicebox_parse_es(const char *payload, uint16_t len, JuiceBoxStatus &out);
+
+// Map a raw JB S-field code (hex value, see JbStateCode) onto the canonical state.
+// FIRM: 0x31/0x21 => Charging, 0x05 => Error. The idle/poll codes (00/01/02/11) map
+// to NotConnected — S alone cannot tell "vehicle plugged, not charging" from "no
+// vehicle"; distinguishing Connected needs the H pilot-voltage field (follow-up).
+LiteEvseState juicebox_map_state(int raw);
+
+// Build "$<type><LLL hex>:<payload>" into buf. Returns bytes written, 0 on overflow.
+size_t juicebox_build_frame(const char *type, const char *payload, char *buf, size_t buflen);
+
+// Build the host->MCU amps-set command into buf ("$<type>002:NN"). Doubles as the
+// comm-watchdog keepalive: re-sending the MCU's reported amps is an idempotent no-op
+// that holds it online. `amps` is clamped to [0,79] (the MCU rejects >= 80).
+// Returns bytes written, 0 on overflow.
+// NOTE: the command TYPE bytes are UNCONFIRMED (need a live UART capture); see
+// docs/superpowers/notes/2026-06-13-juicebox-protocol-re.md.
+size_t juicebox_build_amps_set(int amps, char *buf, size_t buflen);
