@@ -14,6 +14,7 @@ struct JuiceBoxFrame {
   char     type[JB_TYPE_LEN + 1];
   char     payload[JB_MAX_PAYLOAD + 1];
   uint16_t len;                       // payload length
+  char     start;                     // delimiter that began the frame: '$' or '~'
 };
 
 // Decoded $ES status fields (raw JB values, pre-normalization).
@@ -47,12 +48,14 @@ enum JbStateCode {
 // Handles "<TT><3hex>:<payload>" (e.g. $ES01C:...) and "<TT>:<payload>" (e.g. $MD:...).
 bool juicebox_parse_frame_body(const char *raw, size_t n, JuiceBoxFrame &out);
 
-// Incremental, framing-tolerant parser. A frame runs from a '$' to the next '$'
-// or a CR/LF terminator (whichever comes first). Resyncs on '$'. feed() returns
-// true and fills `out` exactly once per completed frame.
+// Incremental, framing-tolerant parser. A frame runs from a start delimiter ('$' or
+// '~') to the next start delimiter or a CR/LF terminator (whichever comes first).
+// Resyncs on '$'/'~'. feed() returns true and fills `out` exactly once per completed
+// frame; out.start records which delimiter began it. The MCU's RX line-assembler
+// accepts both '$' (EVSE protocol) and '~' (WiFi-module identity/version channel).
 class JuiceBoxParser {
 public:
-  JuiceBoxParser() : _n(0), _started(false) {}
+  JuiceBoxParser() : _n(0), _started(false), _frameStart('$') {}
   bool feed(uint8_t b, JuiceBoxFrame &out);
   void reset() { _n = 0; _started = false; }
 private:
@@ -60,6 +63,7 @@ private:
   char   _raw[JB_MAX_PAYLOAD + 16];
   size_t _n;
   bool   _started;
+  char   _frameStart;                 // delimiter of the in-progress frame
 };
 
 // Decode a $ES payload (e.g. "S00,L00,T00,H00,A00,P000,F00") into JuiceBoxStatus.

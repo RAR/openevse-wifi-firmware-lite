@@ -40,6 +40,18 @@ void JuiceBoxBackend::loop() {
   // our own TX/logging on the shared UART is starving reception.
   if (SerialClass_getOverflow()) _rxOverflows++;
 
+  // Identify on the '~' channel once we know the controller is there. The ATmega's RX
+  // strstr's incoming frames for the literal "~MDNFO" (flash 0x6FEC) to take its
+  // host-present/enable path; the OEM Silabs WiFi fw spoke this channel and we hadn't.
+  // Sent once after first contact (UNVALIDATED vs a live OEM capture; see protocol notes).
+  if (_everRx && !_identified) {
+    _port.write((const uint8_t *)"~MDNFO\r\n", 8);
+    _identified = true;
+#ifdef JB_DEBUG
+    LT_I("JBTX(~): #MDNFO  (identify on ~ channel)");
+#endif
+  }
+
   unsigned long now = millis();
   // Keepalive holds the comm watchdog. IMPORTANT (RE-confirmed): $SL is the only $S
   // keepalive and it ALWAYS sets the J1772 pilot current — there is NO current-neutral
@@ -90,6 +102,19 @@ void JuiceBoxBackend::handleFrame(const JuiceBoxFrame &f) {
     LT_I("JBRX [%s] len=%u: %s", f.type, (unsigned)f.len, safe);
   }
 #endif
+  // '~' = WiFi-module identity/version channel (decoded from the ATmega flash). The MCU
+  // sends "~JV:?" to query the host's version and advances its handshake on a "~JV:!<n>$"
+  // reply. We answer with version 1. (Exact <n> + ordering UNVALIDATED vs a live OEM
+  // capture; the parser accepts any small int.) ~ frames carry no EVSE status — return.
+  if (f.start == '~') {
+    if (!strcmp(f.type, "JV") && f.payload[0] == '?') {
+      _port.write((const uint8_t *)"~JV:!1$\r\n", 9);
+#ifdef JB_DEBUG
+      LT_I("JBTX(~): #JV:!1#  (reply to ~JV:? version query)");
+#endif
+    }
+    return;
+  }
   if      (!strcmp(f.type, "ES")) {
     juicebox_parse_es(f.payload, f.len, _status);
 #ifdef JB_DEBUG

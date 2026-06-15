@@ -59,6 +59,7 @@ private:
   // rx_overflow climbing = the receive ring can't keep up (TX/log contention on the UART).
   unsigned long  _rxFrames      = 0;
   unsigned long  _rxOverflows   = 0;
+  bool           _identified    = false;   // sent ~MDNFO identify on the ~ channel once
   // Charge-current limit (A) advertised by the keepalive. Safe 6 A J1772 floor by default;
   // a future control feature will make this settable. NEVER auto-track the MCU's reported max.
   int            _chargeLimit    = 6;

@@ -38,6 +38,7 @@ bool JuiceBoxParser::flush(JuiceBoxFrame &out) {
   if (!_started || _n == 0) { _started = false; _n = 0; return false; }
   _raw[_n] = '\0';
   bool ok = juicebox_parse_frame_body(_raw, _n, out);
+  out.start = _frameStart;   // set after parse_frame_body (which memset-zeroes out)
   _started = false; _n = 0;
   return ok;
 }
@@ -106,9 +107,9 @@ LiteEvseState juicebox_map_state(int raw) {
 }
 
 bool JuiceBoxParser::feed(uint8_t b, JuiceBoxFrame &out) {
-  if (b == '$') {
-    bool ready = flush(out);   // close any in-progress frame
-    _started = true; _n = 0;
+  if (b == '$' || b == '~') {
+    bool ready = flush(out);   // close any in-progress frame (flush stamps its _frameStart)
+    _started = true; _n = 0; _frameStart = (char)b;
     return ready;
   }
   if (b == '\r' || b == '\n') {

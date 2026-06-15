@@ -161,3 +161,27 @@ TEST_CASE("canonical state names are stable") {
   CHECK(strcmp(lite_evse_state_name(LiteEvseState::Error),        "error")         == 0);
   CHECK(strcmp(lite_evse_state_name(LiteEvseState::Unknown),      "unknown")       == 0);
 }
+
+TEST_CASE("tilde (~) is a second frame-start; start delimiter is recorded") {
+  JuiceBoxParser p; JuiceBoxFrame f;
+  // ~JV:?$  — the MCU's version query; the trailing '$' closes the ~ frame.
+  REQUIRE(feed_str(p, "~JV:?$\r\n", f));
+  CHECK(f.start == '~');
+  CHECK(strcmp(f.type, "JV") == 0);
+  CHECK(strcmp(f.payload, "?") == 0);
+}
+TEST_CASE("$ frames still report start '$'") {
+  JuiceBoxParser p; JuiceBoxFrame f;
+  REQUIRE(feed_str(p, "$ES01C:S00,L00,T00,H00,A00,P000,F00\r", f));
+  CHECK(f.start == '$');
+  CHECK(strcmp(f.type, "ES") == 0);
+}
+TEST_CASE("a ~ frame interrupts and flushes a pending ~ frame") {
+  JuiceBoxParser p; JuiceBoxFrame f;
+  // No CR/LF: the next '~' should flush the first (mirrors the '$' resync behavior).
+  bool got = false;
+  for (const char *c = "~JV:?~JV:!1"; *c; ++c) if (p.feed((uint8_t)*c, f)) { got = true; break; }
+  REQUIRE(got);
+  CHECK(f.start == '~');
+  CHECK(strcmp(f.type, "JV") == 0);
+}
