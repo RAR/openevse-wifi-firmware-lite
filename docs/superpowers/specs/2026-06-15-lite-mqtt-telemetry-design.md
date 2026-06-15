@@ -72,7 +72,9 @@ Owns the `WiFiClient` + `PubSubClient`. NOT in the native build filter.
 class LiteMqtt {
 public:
   void begin(const LiteMqttConfig &cfg, const String &shortId,
-             const String &announceJson);   // store cfg; sets server/port/LWT; no blocking connect
+             const String &fwVersion);   // store cfg/id/fw; sets server/port/LWT; no blocking connect
+                                          // announce JSON is built internally at connect
+                                          // (shortId + fwVersion + WiFi.localIP())
   void reconfigure(const LiteMqttConfig &cfg);  // apply changed config live (drops + reconnects)
   // Pumps PubSubClient, reconnects with backoff, and publishes per-field on cadence.
   // statusFn fills a JsonDocument with the status fields to publish.
@@ -108,8 +110,11 @@ struct LiteMqttConfig {
 bool lite_config_load_mqtt(LiteMqttConfig &out);  // false if no key -> caller uses defaults
 bool lite_config_save_mqtt(const LiteMqttConfig &in);
 ```
-Persisted as one FlashDB blob (key `"mqtt"`), same single-blob pattern as
-`divert`/`shaper`. Key *names* mirror upstream `app_config` so any later lift lines up.
+Persisted **per-key** via the existing `kv_set_str`/`kv_get_str` + `kv_set_int`/
+`kv_get_int` helpers (the `String`-bearing pattern used by `wifi`/`clock` configs —
+a `fdb_blob` can't serialize `String` members). Keys: `mqtt_enabled` (int 0/1),
+`mqtt_server`, `mqtt_port` (int), `mqtt_topic`, `mqtt_user`, `mqtt_pass`,
+`mqtt_period` (int). Key *names* mirror upstream `app_config` so any later lift lines up.
 
 ### 4. Status doc reuse (DRY) — `web_server_lite.{h,cpp}`
 `build_status_json(String&)` currently builds a `StaticJsonDocument<1280>` then
@@ -126,14 +131,22 @@ void web_server_lite_build_status(JsonDocument &doc);
 Scalars only are published (string/int/float/bool). Nested objects/arrays, if any,
 are skipped (none today; guard defensively).
 
-### 5. Main loop wiring — `main_lite.cpp`
-- One file-static `LiteMqtt s_mqtt;`
-- At boot after config load: `lite_config_load_mqtt(...)` (defaults if absent),
-  `s_mqtt.begin(cfg, ESPAL.getShortId(), announceJson)`.
-- In `loop()` after `web_server_lite_loop()`:
-  `s_mqtt.loop(millis(), s_manager.isCharging(), &web_server_lite_build_status);`
-- Constants: `LITE_MQTT_IDLE_MS` (from `period_s`), `LITE_MQTT_CHARGE_MS = 5000`,
-  `LITE_MQTT_BACKOFF_MS = 5000`.
+### 5. Loop wiring — `web_server_lite.cpp` (NOT main)
+The divert/shaper config + runtime loops already live in `web_server_lite.cpp`
+(`s_divertCfg`, `s_shaperCfg`, driven by `web_server_lite_loop`). MQTT needs the same
+file's resources (config statics, `build_status_json`, `s_mgr_ctrl->isCharging()`,
+`LITE_FW_VERSION`, `ESPAL`), so it lives there too — no cross-file plumbing.
+- File-statics `LiteMqtt s_mqtt;` and `LiteMqttConfig s_mqttCfg;`.
+- `web_server_lite_begin(...)`: `lite_config_load_mqtt(s_mqttCfg)` (defaults if absent),
+  then `s_mqtt.begin(s_mqttCfg, ESPAL.getShortId(), LITE_FW_VERSION)`.
+- `web_server_lite_loop()` (end): `s_mqtt.loop(millis(),
+  s_mgr_ctrl && s_mgr_ctrl->isCharging(), &web_server_lite_build_status);`
+- Constants (top of `lite_mqtt.cpp`): `LITE_MQTT_CHARGE_MS = 5000`,
+  `LITE_MQTT_BACKOFF_MS = 5000`; idle period comes from `cfg.period_s * 1000`
+  (default 30 s when `period_s == 0`).
+- `web_server_lite_build_status(JsonDocument&)` is a non-static free function (declared
+  in `web_server_lite.h`, needs `#include <ArduinoJson.h>` there) so it can be passed as
+  the `statusFn` pointer.
 
 ### 6. `/config` integration — `web_server_lite.cpp`
 - `config_json`: emit `mqtt_enabled`, `mqtt_server`, `mqtt_port`, `mqtt_topic`,
@@ -198,9 +211,8 @@ flips `online`/`offline` on connect/power-off (LWT), and `/config` round-trips s
 | `src/lite/lite_mqtt.cpp` | Create — PubSubClient glue |
 | `src/lite/lite_config_store.h` | Add `LiteMqttConfig` + load/save decls |
 | `src/lite/lite_config_store.cpp` | Add load/save (FlashDB blob `"mqtt"`) |
-| `src/lite/web_server_lite.h` | Add `web_server_lite_build_status` decl |
-| `src/lite/web_server_lite.cpp` | Extract status doc builder; `/config` mqtt fields |
-| `src/lite/main_lite.cpp` | `s_mqtt` instance + begin + loop wiring |
+| `src/lite/web_server_lite.h` | `#include <ArduinoJson.h>`; add `web_server_lite_build_status` decl |
+| `src/lite/web_server_lite.cpp` | Extract status doc builder; `s_mqtt`+`s_mqttCfg`; begin/loop wiring; `/config` mqtt fields |
 | `platformio.ini` | `lib_deps += knolleary/PubSubClient`; native filter += policy |
 | `test/test_lite_mqtt/` | Create — native doctest for policy |
 
