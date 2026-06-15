@@ -40,23 +40,26 @@ void JuiceBoxBackend::loop() {
   // our own TX/logging on the shared UART is starving reception.
   if (SerialClass_getOverflow()) _rxOverflows++;
 
-  // Identify on the '~' channel once we know the controller is there. The ATmega's RX
-  // strstr's incoming frames for the literal "~MDNFO" (flash 0x6FEC) to take its
-  // host-present/enable path; the OEM Silabs WiFi fw spoke this channel and we hadn't.
-  // Sent once after first contact (UNVALIDATED vs a live OEM capture; see protocol notes).
+  // Identify on the '~' channel once we know the controller is there, mimicking the stock
+  // Gecko OS boot's ~MDCRI: identity dump (values from the 2026-05-26 OEM capture). The
+  // ATmega sniffs the '~' channel for the WiFi module's presence; the OEM streamed exactly
+  // this. Sent once after first contact. (Identity strings are this bench unit's; for
+  // production each unit differs. UNVALIDATED for charging — GFI HW fault gates that anyway.)
   if (_everRx && !_identified) {
-    _port.write((const uint8_t *)"~MDNFO\r\n", 8);
+    _port.print("~MDCRI:EMWERK-JB201-1.0.46, Gecko_OS-STANDARD-4.2.7-11064, WGM160P\r\n");
+    _port.print("~MDCRI:Zn UUID EADE2FF30BE60E508EF4C515F4B3B1FFFEA21297\r\n");
+    _port.print("~MDCRI:JNetID:<0910040100000500000000620001>\r\n");
+    _port.print("~MDCRI:EMM SERIAL:<  17EMOTORWERKS00030>\r\n");
     _identified = true;
 #ifdef JB_DEBUG
-    LT_I("JBTX(~): #MDNFO  (identify on ~ channel)");
+    LT_I("JBTX(~): #MDCRI identity burst (FW/UUID/JNetID/serial)");
 #endif
   }
 
   unsigned long now = millis();
-  // Keepalive holds the comm watchdog. IMPORTANT (RE-confirmed): $SL is the only $S
-  // keepalive and it ALWAYS sets the J1772 pilot current — there is NO current-neutral
-  // heartbeat — so we advertise a deliberate safe limit (_chargeLimit, default 6 A floor),
-  // never the MCU's reported max. Gated on _everRx so we don't transmit into a silent line.
+  // Keepalive holds the comm watchdog via a '~'-channel heartbeat (see sendKeepalive) —
+  // matching how the stock module keeps the MCU online. Gated on _everRx so we don't
+  // transmit into a silent line.
   if (_everRx && (now - _lastBeatMillis) >= JB_KEEPALIVE_INTERVAL_MS) {
     sendKeepalive();
     _lastBeatMillis = now;
@@ -135,22 +138,19 @@ void JuiceBoxBackend::handleFrame(const JuiceBoxFrame &f) {
 }
 
 void JuiceBoxBackend::sendKeepalive() {
-  // Advertise the deliberate safe limit, not the MCU's reported max. juicebox_build_amps_set
-  // clamps to [0,79]; the MCU further clamps <6 up to the 6 A J1772 floor.
-  char buf[32];
-  // Disabled => command 0 A. Per RE (SERIAL_PROTOCOL.md §4) an active limit < 6 A clears
-  // the MCU's charge-enable gate (the real J1772 stop) — so we MUST keep sending (at 0),
-  // not go silent: silence drops the MCU to offline mode where it keeps charging at the
-  // persisted offline limit. Enabled => advertise the configured limit.
-  int amps = _enabled ? _chargeLimit : 0;
-  size_t n = juicebox_build_amps_set(amps, buf, sizeof(buf));
-  if (n) {
-    _port.write((const uint8_t *)buf, n);
+  // Heartbeat on the '~' channel, mimicking the stock Gecko OS module's idle telemetry
+  // (~MDNFO:V1:65535/A1:65535 — meter sentinel, 65535 = no meter). Any assembled line
+  // clears the ATmega's offline bit (0xa14, common path) so this holds the comm watchdog
+  // online exactly like the OEM did, and it carries the "~MDNFO" substring the MCU sniffs
+  // for WiFi-module presence (strstr @0x6790). This REPLACES the old $AL keepalive: the
+  // OEM keeps the MCU alive purely via '~' chatter (its console shows no '$' frames).
+  // The $AL amps-set (juicebox_build_amps_set) is the separate charge-current command,
+  // sent on demand when we actually drive current — not the heartbeat. (UNVALIDATED for
+  // charging: GFI HW self-test gates that on this bench regardless. See protocol notes.)
+  _port.print("~MDNFO:V1:65535/A1:65535\r\n");
 #ifdef JB_DEBUG
-    char safe[32]; jb_log_safe(safe, sizeof(safe), buf);
-    LT_I("JBTX: %s", safe);   // what we send the Atmel (e.g. #AL002:24)
+  LT_I("JBTX(~): #MDNFO:V1:65535/A1:65535  (~ keepalive)");
 #endif
-  }
 }
 
 void JuiceBoxBackend::addStatusFields(JsonDocument &doc) const {
