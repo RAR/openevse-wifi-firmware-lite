@@ -46,10 +46,11 @@ void JuiceBoxBackend::loop() {
   // this. Sent once after first contact. (Identity strings are this bench unit's; for
   // production each unit differs. UNVALIDATED for charging — GFI HW fault gates that anyway.)
   if (_everRx && !_identified) {
-    _port.print("~MDCRI:EMWERK-JB201-1.0.46, Gecko_OS-STANDARD-4.2.7-11064, WGM160P\r\n");
-    _port.print("~MDCRI:Zn UUID EADE2FF30BE60E508EF4C515F4B3B1FFFEA21297\r\n");
-    _port.print("~MDCRI:JNetID:<0910040100000500000000620001>\r\n");
-    _port.print("~MDCRI:EMM SERIAL:<  17EMOTORWERKS00030>\r\n");
+    // LF (\n) only — byte-faithful to the OEM (its console staircases = LF without CR).
+    _port.print("~MDCRI:EMWERK-JB201-1.0.46, Gecko_OS-STANDARD-4.2.7-11064, WGM160P\n");
+    _port.print("~MDCRI:Zn UUID EADE2FF30BE60E508EF4C515F4B3B1FFFEA21297\n");
+    _port.print("~MDCRI:JNetID:<0910040100000500000000620001>\n");
+    _port.print("~MDCRI:EMM SERIAL:<  17EMOTORWERKS00030>\n");
     _identified = true;
 #ifdef JB_DEBUG
     LT_I("JBTX(~): #MDCRI identity burst (FW/UUID/JNetID/serial)");
@@ -111,7 +112,7 @@ void JuiceBoxBackend::handleFrame(const JuiceBoxFrame &f) {
   // capture; the parser accepts any small int.) ~ frames carry no EVSE status — return.
   if (f.start == '~') {
     if (!strcmp(f.type, "JV") && f.payload[0] == '?') {
-      _port.write((const uint8_t *)"~JV:!1$\r\n", 9);
+      _port.print("~JV:!1$\n");   // LF only, matching the OEM line terminator
 #ifdef JB_DEBUG
       LT_I("JBTX(~): #JV:!1#  (reply to ~JV:? version query)");
 #endif
@@ -147,7 +148,7 @@ void JuiceBoxBackend::sendKeepalive() {
   // The $AL amps-set (juicebox_build_amps_set) is the separate charge-current command,
   // sent on demand when we actually drive current — not the heartbeat. (UNVALIDATED for
   // charging: GFI HW self-test gates that on this bench regardless. See protocol notes.)
-  _port.print("~MDNFO:V1:65535/A1:65535\r\n");
+  _port.print("~MDNFO:V1:65535/A1:65535\n");   // LF only, matching the OEM line terminator
 #ifdef JB_DEBUG
   LT_I("JBTX(~): #MDNFO:V1:65535/A1:65535  (~ keepalive)");
 #endif
