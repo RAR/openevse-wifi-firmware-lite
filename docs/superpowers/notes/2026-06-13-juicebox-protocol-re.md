@@ -316,3 +316,50 @@ Inbound (WiFi→MCU) confirmed: `$WC`, `$WR` (handshake tokens, §3) and the `?L
 data. Before driving a real 40 A contactor, a **live UART capture is required** to (a) confirm the offline
 timeout in seconds, (b) nail the exact amps-command 2-char type, and (c) confirm the S per-state integers
 and the L/H/P field meanings.
+
+---
+
+## 7. The `~` channel (WiFi-module ↔ MCU control/identity) — decoded 2026-06-15
+
+The RX line-assembler accepts a SECOND frame-start delimiter, **`~` (0x7E)**, alongside
+`$` (checks at 0x9d2 for `$`, 0xd3c/0xf90 for `~`; `~` routes to the handler at 0x1176).
+Both delimiters share the post-assembly common path: **the offline bit (0x0535 bit1) is
+cleared at 0x0a14 for ANY assembled line** — so a `~` frame keeps the comm-watchdog online
+exactly like a `$` frame (empirically confirmed: the stock module's console emits ONLY `~`
+chatter, no `$`, and stock units stay online).
+
+**The MCU's entire `~` vocabulary (only `~` strings in the flash):**
+- `~MDNFO` (flash 0x6FEC) — the needle the MCU `strstr`s for (matcher = 0x6790,
+  `strstr(haystack, needle)`). Checked at **0x117e** (the `~`-handler enable path) AND in
+  the **`$WC` charge-enable guard chain** (0x155e/0x156c/0x157a). So a received frame
+  CONTAINING `~MDNFO` is the "WiFi module present" signal and a precondition for charge-enable.
+- `~JV:?$` (0x7090) — version QUERY.
+- `~JV:!%d$` (0x7099) — version RESPONSE template (a small int).
+- `~JV:Xdfuu --factory SILABS$` (0x70A4) — **factory/DFU reflash command aimed at the
+  Silabs module. NEVER SEND.**
+- (`~MDCRI`, `~IP`, `~MDERR`, `~MDWRN` are NOT in the MCU flash — they're the *module's*
+  GeckoOS log output, which the MCU ignores except for sniffing the `~MDNFO` substring.)
+
+**Inbound `~JV` subtype dispatch** (3rd char after `~JV`, at SRAM 0x0545/0x0547):
+`?`=query, `!<n>`=version-number parse (digit-fold at 0x11c6 → 0x05C7, gated on 0x05C6==1
+→ sets 0x05C8=2), **`X`→0x1926 (factory DFU)**, `Y`→0x1912, `T` → (UNKNOWN subtypes).
+
+**MCU-INITIATED `~JV` (TX action state, RAM 0x05C8, emitter ~0x42f6):**
+`0x05C8==1` → MCU sends `~JV:?$` (queries host version); `==2` → sends `~JV:!<n>$`;
+`==3` → sends the factory-DFU string. So the contract is a handshake: MCU sends `~JV:?$`
+and wants `~JV:!<n>$` back (and vice-versa). Boot ordering UNKNOWN (who initiates first) —
+needs a live healthy-unit capture.
+
+**Line terminator:** `~` frames are LF-only (`\n`, 0x0A) on the wire — the OEM console
+"staircase" is LF-without-CR. The MCU's assembler ends a line on CR OR LF, so CRLF also
+works but isn't byte-faithful.
+
+**NOT host-clearable / NOT a charging bypass:** the `~` channel is presence + version only.
+It does NOT clear the hardware-latched GFI/pilot self-test faults (§5 / fault word
+0x0517:0x0518) — those need real GFI/pilot hardware. The boot self-test suite + codes:
+001 FW Self Tests / 004 Short Circuit Pilot / 005 Pilot Signal Gen Fail / 006 GFI Auto
+Test Fail / 007 Relay Stuck Closed / 008 GFI Lockout / 102 Relay Stuck Open. The pilot
+±12 V rails are mains-derived, so off-mains (bench logic power) it fails 005 *before*
+reaching 006; on 120 V it reaches 006 (GFI). Comm-watchdog: 3000-count, reloaded per valid
+frame (0x91c/0xd92); tick period unproven (~3 s LIKELY, ≤30 s); OEM streamed `~IP` many/sec,
+consistent with the short end.
