@@ -203,4 +203,41 @@ bool lite_config_save_clock(const LiteClockConfig &in)
   ok = kv_set_int("tz_offset_min", in.tz_offset_min) && ok;
   return ok;
 }
+
+// --- MQTT telemetry config (per-key; String members preclude a blob) ---
+
+bool lite_config_load_mqtt(LiteMqttConfig &out)
+{
+  out.enabled  = false;          // defaults
+  out.server   = "";
+  out.port     = 1883;
+  out.topic    = "";
+  out.user     = "";
+  out.pass     = "";
+  out.period_s = 30;
+  if (!s_ready) return false;
+  int en = 0, port = 1883, period = 30;
+  bool any = false;
+  if (kv_get_int("mqtt_enabled", en)) { out.enabled = (en != 0); any = true; }
+  { String s; if (kv_get_str("mqtt_server", s)) { out.server = s; any = true; } }
+  if (kv_get_int("mqtt_port", port))   { out.port = port; any = true; }
+  { String s; if (kv_get_str("mqtt_topic", s)) { out.topic = s; any = true; } }
+  { String s; if (kv_get_str("mqtt_user",  s)) { out.user = s;  any = true; } }
+  { String s; if (kv_get_str("mqtt_pass",  s)) { out.pass = s;  any = true; } }
+  if (kv_get_int("mqtt_period", period)) { out.period_s = (uint32_t)period; any = true; }
+  return any;
+}
+
+bool lite_config_save_mqtt(const LiteMqttConfig &in)
+{
+  if (!s_ready) return false;
+  bool ok = kv_set_int("mqtt_enabled", in.enabled ? 1 : 0);
+  ok = kv_set_str("mqtt_server", in.server)            && ok;
+  ok = kv_set_int("mqtt_port",   in.port)              && ok;
+  ok = kv_set_str("mqtt_topic",  in.topic)             && ok;
+  ok = kv_set_str("mqtt_user",   in.user)              && ok;
+  ok = kv_set_str("mqtt_pass",   in.pass)              && ok;
+  ok = kv_set_int("mqtt_period", (int)in.period_s)     && ok;
+  return ok;
+}
 #endif

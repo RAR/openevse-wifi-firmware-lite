@@ -59,4 +59,19 @@ bool lite_config_save_shaper(const LiteShaperConfig &in);
 
 bool lite_config_load_clock(LiteClockConfig &out);     // fills defaults if keys absent
 bool lite_config_save_clock(const LiteClockConfig &in);
+
+// MQTT telemetry config. Persisted PER-KEY (mqtt_enabled/mqtt_server/mqtt_port/
+// mqtt_topic/mqtt_user/mqtt_pass/mqtt_period) because String members can't go in a
+// fdb_blob — same pattern as wifi/clock. Key names mirror upstream app_config.
+struct LiteMqttConfig {
+  bool     enabled;   // default false
+  String   server;    // broker host/IP, default ""
+  int      port;      // default 1883
+  String   topic;     // base topic; "" -> mqtt_default_base(shortId) at runtime
+  String   user;      // default ""
+  String   pass;      // default ""
+  uint32_t period_s;  // idle publish period seconds, default 30
+};
+bool lite_config_load_mqtt(LiteMqttConfig &out);  // fills defaults; true if any key present
+bool lite_config_save_mqtt(const LiteMqttConfig &in);
 #endif
