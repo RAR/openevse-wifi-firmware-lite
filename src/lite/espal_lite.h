@@ -13,6 +13,7 @@ public:
   String getChipInfo();
   void reset();          // NVIC_SystemReset via LibreTiny
   void eraseConfig();    // factory-reset hook; no-op stub (config lives in FlashDB, see lite_config_store)
+  String getRebootReason(); // RMU reset cause latched at begin() (power/brownout/watchdog/software/crash/...)
 };
 
 extern EspalLite ESPAL;

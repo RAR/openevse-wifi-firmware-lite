@@ -3,7 +3,15 @@
 #include "espal_lite_format.h"
 
 #include <libretiny.h>
-#include "lt_family.h"   // pulls in em_device.h -> DEVINFO struct (Gecko SDK)
+#include "lt_family.h"   // pulls in em_device.h -> DEVINFO + RMU register defs (Gecko SDK)
+
+// Reset cause latched in begin() before anything can clear it. RMU->RSTCAUSE bits are
+// sticky and accumulate across resets (and PORST has top priority), so we read once at
+// boot then clear, leaving the NEXT reset's cause unambiguous. See getRebootReason().
+// (emlib RMU_ResetCauseClear() isn't compiled into the linked emlib subset, but on
+// GG11 — Series 1, no EMU_AUXCTRL_HRCCLR — it reduces to just `RMU->CMD = RMU_CMD_RCCLR`,
+// which clears every cause bit incl. PORST. So we issue that register write directly.)
+static lt_reboot_reason_t s_rebootReason = REBOOT_REASON_UNKNOWN;
 
 // EFM32 DEVINFO unique id source: DEVINFO->UNIQUEL (bits 31:0) and DEVINFO->UNIQUEH
 // (bits 63:32). LibreTiny's lt_cpu_get_unique_id() returns only the low 24 bits, so
@@ -13,8 +21,27 @@ static inline uint64_t lite_efm32_uid64() {
 }
 
 void EspalLite::begin() {
-  // Nothing to initialise on the EFM32 side for ESPAL itself; peripherals
-  // are brought up by their own subsystems.
+  // Latch the reset cause first thing, then clear RMU->RSTCAUSE so the NEXT reset
+  // reports a clean, unambiguous cause. ESPAL.begin() is the earliest app hook
+  // (called before WiFi/FlashDB in setup), so nothing has perturbed RSTCAUSE yet.
+  s_rebootReason = lt_get_reboot_reason();
+  RMU->CMD = RMU_CMD_RCCLR;   // clear RSTCAUSE so the next reset's cause is unambiguous
+}
+
+String EspalLite::getRebootReason() {
+  switch (s_rebootReason) {
+    case REBOOT_REASON_POWER:      return F("power");      // POR
+    case REBOOT_REASON_BROWNOUT:   return F("brownout");   // AVDD BOD
+    case REBOOT_REASON_HARDWARE:   return F("hardware");   // external reset pin
+    case REBOOT_REASON_SOFTWARE:   return F("software");   // NVIC_SystemReset (e.g. post-/connect)
+    case REBOOT_REASON_WATCHDOG:   return F("watchdog");
+    case REBOOT_REASON_CRASH:      return F("crash");      // lockup (hard fault)
+    case REBOOT_REASON_SLEEP_GPIO: return F("sleep_gpio");
+    case REBOOT_REASON_SLEEP_RTC:  return F("sleep_rtc");
+    case REBOOT_REASON_SLEEP_USB:  return F("sleep_usb");
+    case REBOOT_REASON_DEBUGGER:   return F("debugger");
+    default:                       return F("unknown");
+  }
 }
 
 uint32_t EspalLite::getFreeHeap() {

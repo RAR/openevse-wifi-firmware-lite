@@ -369,6 +369,7 @@ void web_server_lite_build_status(JsonDocument &doc)
   doc["free_heap"] = ESPAL.getFreeHeap();
   doc["freeram"]   = ESPAL.getFreeHeap();
   doc["uptime"]    = (uint32_t)(millis() / 1000);
+  doc["reboot_reason"] = ESPAL.getRebootReason();   // RMU cause of the last reset (latched at boot)
   doc["schedule_version"] = s_scheduleVersion;
 
   if (s_clock && s_clock->valid()) {
