@@ -8,9 +8,11 @@
 // because the ring was full — i.e. we couldn't drain fast enough (TX/log contention).
 extern bool SerialClass_getOverflow();
 
-// Comm-watchdog reload is ~3000 ticks (~3 s, LIKELY per the Task 1 RE note);
-// keepalive comfortably under it. Adjust once the timeout is HW-confirmed.
-static const unsigned long JB_KEEPALIVE_INTERVAL_MS = 1000;
+// Comm-watchdog reload is 3000 ticks; tick period unproven (RE flagged ~3 s LIKELY, up to
+// ~30 s). 15 s keepalive doubles as the empirical probe: if the MCU stays online at this
+// spacing the watchdog is >=15 s; if it flaps offline between beats, it's shorter (tighten
+// back down). Reduce once the timeout is HW-confirmed.
+static const unsigned long JB_KEEPALIVE_INTERVAL_MS = 15000;
 // Offline timeout must EXCEED the Atmel's slowest liveness frame. HW-observed
 // 2026-06-13: in steady state the ONLY inbound frame is a $TP ping every ~63 s
 // (metronomic; $ES/$MD only at boot/on-change). A 5 s timeout made isOnline()
