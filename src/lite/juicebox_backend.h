@@ -53,6 +53,12 @@ private:
   unsigned long  _lastRxMillis   = 0;
   unsigned long  _lastBeatMillis = 0;
   bool           _everRx         = false;   // flips true only after a frame is received
+  // RX-health diagnostics (exposed in /status): total framed inbound messages and the
+  // accumulated count of RX ring-overflow events (bytes the IRQ had to drop). Climbing
+  // rx_frames = receiving; flat rx_frames while the controller transmits = dropping bursts;
+  // rx_overflow climbing = the receive ring can't keep up (TX/log contention on the UART).
+  unsigned long  _rxFrames      = 0;
+  unsigned long  _rxOverflows   = 0;
   // Charge-current limit (A) advertised by the keepalive. Safe 6 A J1772 floor by default;
   // a future control feature will make this settable. NEVER auto-track the MCU's reported max.
   int            _chargeLimit    = 6;

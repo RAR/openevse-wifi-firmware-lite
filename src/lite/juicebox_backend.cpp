@@ -1,6 +1,12 @@
 #if defined(OPENEVSE_LITE) && defined(LITE_EVSE_BACKEND_JUICEBOX)
 #include "juicebox_backend.h"
 #include <string.h>
+#include "lt_family.h"   // USART0 register access (em_device) — RX-wedge diagnostics
+
+// Read-and-clear the USART0 RX ring-overflow flag (silabs core; declared in the core's
+// SerialPrivate.h, which app code doesn't include). True => the RX IRQ had to drop bytes
+// because the ring was full — i.e. we couldn't drain fast enough (TX/log contention).
+extern bool SerialClass_getOverflow();
 
 // Comm-watchdog reload is ~3000 ticks (~3 s, LIKELY per the Task 1 RE note);
 // keepalive comfortably under it. Adjust once the timeout is HW-confirmed.
@@ -25,9 +31,14 @@ void JuiceBoxBackend::loop() {
     if (_parser.feed((uint8_t)b, f)) {
       _lastRxMillis = millis();
       _everRx = true;
+      _rxFrames++;
       handleFrame(f);
     }
   }
+  // Accumulate RX ring-overflow events (read-and-clear). Polled once per loop; if the
+  // ring filled since last loop, we dropped inbound bytes — a direct measure of whether
+  // our own TX/logging on the shared UART is starving reception.
+  if (SerialClass_getOverflow()) _rxOverflows++;
 
   unsigned long now = millis();
   // Keepalive holds the comm watchdog. IMPORTANT (RE-confirmed): $SL is the only $S
@@ -126,5 +137,21 @@ void JuiceBoxBackend::addStatusFields(JsonDocument &doc) const {
   if (_wc[0]) doc["wc"]       = _wc;
   if (_wr[0]) doc["wr"]       = _wr;
   doc["line"] = _status.line;          // raw JB L field (semantics unknown per RE)
+
+  // RX-health (diagnostic): comms_online mirrors isOnline(); rx_age_ms is time since the
+  // last framed inbound message; rx_frames counts all framed messages; rx_overflow counts
+  // RX-ring overflow events. Watch rx_frames climb (receiving) vs flatline (dropping), and
+  // rx_overflow (UART can't keep up). Note md/wr/state above are STICKY (last value), so
+  // these RX-health counters are the only true live-reception signal.
+  doc["comms_online"] = isOnline();
+  doc["rx_age_ms"]    = (uint32_t)(millis() - _lastRxMillis);
+  doc["rx_frames"]    = (uint32_t)_rxFrames;
+  doc["rx_overflow"]  = (uint32_t)_rxOverflows;
+  // Raw USART0 hardware flags to confirm an RX wedge. IF error bits: RXOF=hw FIFO overflow,
+  // FERR=framing error, PERR=parity. STATUS: RXENS=receiver enabled, RXBLOCK=RX blocked,
+  // RXDATAV=byte available, RXFULL. If RX dies with FERR/RXOF latched in uart_if, the
+  // receiver is stuck on an unhandled error (the RX IRQ never clears these). Diagnostic only.
+  doc["uart_if"]     = (uint32_t)USART0->IF;
+  doc["uart_status"] = (uint32_t)USART0->STATUS;
 }
 #endif

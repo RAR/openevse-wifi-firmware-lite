@@ -395,7 +395,8 @@ void web_server_lite_build_status(JsonDocument &doc)
 
 static void build_status_json(String &out)
 {
-  StaticJsonDocument<1280> doc;
+  StaticJsonDocument<1792> doc;   // bumped from 1280: field set grew (reboot_reason + rx-health);
+                                  // 1280 was overflowing and silently dropping trailing fields
   web_server_lite_build_status(doc);
   serializeJson(doc, out);
 }

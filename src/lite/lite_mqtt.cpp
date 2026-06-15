@@ -106,7 +106,7 @@ void LiteMqtt::loop(uint32_t nowMs, bool charging, void (*statusFn)(JsonDocument
   uint32_t idleMs = _cfg.period_s ? _cfg.period_s * 1000u : 30000u;
   if (mqtt_should_publish(_lastPublish, nowMs, idleMs, LITE_MQTT_CHARGE_MS, charging)) {
     _lastPublish = nowMs;
-    StaticJsonDocument<1280> doc;
+    StaticJsonDocument<1792> doc;   // match build_status_json capacity (full field set)
     statusFn(doc);
     publishFields(doc);
   }
