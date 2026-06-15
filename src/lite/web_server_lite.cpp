@@ -308,10 +308,8 @@ static void status_post_apply(const char *body, size_t len)
 // Home Assistant integration consumes (it polls this every 60 s). Keys it reads
 // but a JuiceBox can't provide (divert/shaper/OCPP/GFCI counts/etc.) are simply
 // omitted — the integration's .get() defaults tolerate absent keys.
-static void build_status_json(String &out)
+void web_server_lite_build_status(JsonDocument &doc)
 {
-  StaticJsonDocument<1280> doc;
-
   if (s_mgr_ctrl) {
     LiteEvseState dev   = s_mgr_ctrl->getDeviceState();
     bool disabled       = (s_mgr_ctrl->getState() == EvseState::Disabled);
@@ -387,7 +385,12 @@ static void build_status_json(String &out)
   if (s_feed.grid_valid)    doc["grid_ie"]         = s_feed.grid_ie_w;
   if (s_feed.voltage_valid) doc["voltage"]         = s_feed.voltage;
   if (s_feed.shaper_valid)  doc["shaper_live_pwr"] = s_feed.shaper_w;
+}
 
+static void build_status_json(String &out)
+{
+  StaticJsonDocument<1280> doc;
+  web_server_lite_build_status(doc);
   serializeJson(doc, out);
 }
 
