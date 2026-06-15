@@ -19,6 +19,7 @@
 #include "lite_schedule.h"
 #include "lite_openevse_compat.h"
 #include "lite_feed.h"
+#include "lite_mqtt.h"
 #include "lite_divert.h"
 #include "lite_shaper.h"
 #include "lite_provision.h"
@@ -88,6 +89,10 @@ static LiteDivertConfig s_divertCfg = { false, 0, 1.1, 20, 600, 600 }; // upstre
 
 // Load-shaper config cached in RAM. Seeded at begin() from the store (or upstream defaults).
 static LiteShaperConfig s_shaperCfg = { false, 0, 60, 120, 300 }; // upstream defaults
+
+// MQTT telemetry publisher + its config (loaded in begin, mutated by /config).
+static LiteMqtt       s_mqtt;
+static LiteMqttConfig s_mqttCfg;
 
 // Pushed sensor feed (3c POST /status). Read by the divert/shaper glue below.
 static LiteFeed s_feed;
@@ -563,6 +568,9 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
   lite_config_load_divert(s_divertCfg);   // keeps defaults if the key is absent
   lite_config_load_shaper(s_shaperCfg);  // keeps defaults if the key is absent
 
+  lite_config_load_mqtt(s_mqttCfg);       // fills defaults if absent (disabled by default)
+  s_mqtt.begin(s_mqttCfg, ESPAL.getShortId(), LITE_FW_VERSION);
+
   s_server.on("/", handle_root);
   s_server.on("/status", handle_status);
   s_server.on("/config", handle_config);
@@ -731,5 +739,10 @@ void web_server_lite_loop()
     s_mgr_ctrl->release(EvseClient_OpenEVSE_Divert);   // divert turned off -> drop the claim
     s_divertState.smoothed_available = 0;
   }
+
+  // MQTT telemetry: per-field publish on cadence (faster while charging). No-op when
+  // disabled or WiFi down. Reuses the /status doc builder so fields stay in sync.
+  s_mqtt.loop(millis(), s_mgr_ctrl && s_mgr_ctrl->isCharging(),
+              &web_server_lite_build_status);
 }
 #endif
