@@ -23,6 +23,7 @@
 #include "lite_shaper.h"
 #include "lite_provision.h"
 #include "web_ui_lite.h"
+#include "lwip/apps/sntp.h"
 
 // Reported as OpenEVSE `firmware`/`version` so the HA integration shows a value.
 #ifndef LITE_FW_VERSION
@@ -36,6 +37,16 @@ extern ManualOverride manual;
 // (no raw lwIP from the poll task; no 26 KB single mbuf). One client per
 // handleClient() pass — fine for the single-client setup/dashboard.
 static WebServer s_server(80);
+
+// lwIP SNTP calls this (SNTP_SET_SYSTEM_TIME in lwipopts.h) with Unix seconds.
+// Runs on the tcpip thread, so only stash — the value is applied to the clock
+// from web_server_lite_loop() on the main task.
+static volatile uint32_t s_sntpEpoch = 0;
+static volatile bool     s_sntpHave  = false;
+extern "C" void lite_sntp_set_system_time(unsigned int sec) {
+  s_sntpEpoch = (uint32_t)sec;
+  s_sntpHave  = true;
+}
 
 // Live LiteEvseManager handle stashed at begin() (the handler is a C-style callback
 // and cannot capture, so a static pointer is how it reaches device state).
@@ -420,7 +431,7 @@ static void handle_config()
     LiteClockConfig cc; lite_config_load_clock(cc);
     cc.sntp_hostname = v.c_str(); lite_config_save_clock(cc);
     s_sntpHost = v.c_str();
-    // Task 3 adds: sntp_setservername(0, s_sntpHost.c_str());
+    sntp_setservername(0, s_sntpHost.c_str());
   }
 
   LiteDivertConfig dcfg = s_divertCfg; bool dany = false;
@@ -559,12 +570,18 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
   s_server.on("/connect", handle_connect);
   s_server.onNotFound(handle_not_found);
   s_server.begin();
-  // Task 3 adds lwIP SNTP init here.
+  sntp_setoperatingmode(SNTP_OPMODE_POLL);
+  sntp_setservername(0, s_sntpHost.c_str());   // s_sntpHost is a stable static String
+  sntp_init();
 }
 
 void web_server_lite_loop()
 {
   s_server.handleClient();
+  if (s_sntpHave && s_clock) {
+    s_sntpHave = false;
+    s_clock->setEpoch((uint32_t)s_sntpEpoch, millis());
+  }
 
   // Deferred post-/connect reboot: fires once the queued instant has passed, so
   // the {"msg":"OK"} response has been polled out before the radio resets.
