@@ -102,6 +102,19 @@ WebServer's `Parsing.cpp` URL-decodes query args, matching the old
 3. `/connect`: handler saves creds, sends `200`, sets `s_rebootPending` +
    `s_rebootAtMs`; `web_server_lite_loop()` reboots after the response flushes.
 
+## Time sync (SNTP)
+
+Mongoose provided SNTP (`mg_sntp_get_time`, `MG_ENABLE_SNTP`). Replace it with the
+**lwIP built-in SNTP app** (`apps/sntp`), which ships in the gecko-sdk lwIP but is
+not currently enabled/compiled. This requires a one-time **libretiny-fork** change
+(`lwipopts.h`: `SNTP_SUPPORT=1`, `SNTP_SERVER_DNS=1`, a `SNTP_SET_SYSTEM_TIME(sec)`
+macro hooking a firmware-provided `lite_sntp_set_system_time(unsigned)`; plus adding
+`src/apps/sntp/sntp.c` to the lwIP build). The firmware calls `sntp_setoperatingmode`
+/`sntp_setservername`/`sntp_init` in `web_server_lite_begin`, and the hook stashes the
+epoch (set on the tcpip thread) for `web_server_lite_loop` to apply via
+`LiteClock::setEpoch` on the main task. The transport migration does **not** depend on
+this — it builds with the clock unsynced; SNTP wires in once the fork change is pulled.
+
 ## WebSocket removal + GUI coordination
 
 - Firmware: delete `lite_ws.*`, the handshake, and all broadcast calls. No `/ws` route.
