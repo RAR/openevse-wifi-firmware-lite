@@ -45,8 +45,9 @@ void EspalLite::reset() {
 }
 
 void EspalLite::eraseConfig() {
-  // Persistence is deferred this slice (the LibreTiny fork ships no LittleFS),
-  // so config-erase is a no-op stub. WiFi creds come from build flags.
+  // Factory-reset hook: no-op stub for now. Config (incl. stored-only WiFi creds)
+  // lives in the FlashDB KVS — see lite_config_store; a real wipe would clear that
+  // KVDB rather than any filesystem.
 }
 
 EspalLite ESPAL;

@@ -12,7 +12,7 @@ public:
   uint32_t getFlashChipSize();
   String getChipInfo();
   void reset();          // NVIC_SystemReset via LibreTiny
-  void eraseConfig();    // clear the LittleFS config region (Task 4 owns the store)
+  void eraseConfig();    // factory-reset hook; no-op stub (config lives in FlashDB, see lite_config_store)
 };
 
 extern EspalLite ESPAL;
