@@ -402,7 +402,7 @@ static void build_status_json(String &out)
 // Serialize the cached config as the canonical /config response body.
 static void config_json(String &out)
 {
-  StaticJsonDocument<384> doc;
+  StaticJsonDocument<640> doc;
   doc["max_current_soft"] = s_cfg.max_current_soft;
   doc["max_current_hard"] = s_cfg.max_current_hard;
   doc["divert_enabled"]               = s_divertCfg.enabled;
@@ -416,6 +416,13 @@ static void config_json(String &out)
   doc["current_shaper_smoothing_time"]   = s_shaperCfg.smoothing_s;
   doc["current_shaper_data_maxinterval"] = s_shaperCfg.data_maxinterval_s;
   doc["current_shaper_min_pause_time"]   = s_shaperCfg.min_pause_s;
+  doc["mqtt_enabled"] = s_mqttCfg.enabled;
+  doc["mqtt_server"]  = s_mqttCfg.server;
+  doc["mqtt_port"]    = s_mqttCfg.port;
+  doc["mqtt_topic"]   = s_mqttCfg.topic;
+  doc["mqtt_user"]    = s_mqttCfg.user;
+  doc["mqtt_period"]  = s_mqttCfg.period_s;
+  // mqtt_pass intentionally NOT echoed; a present non-empty mqtt_pass on POST replaces it.
   serializeJson(doc, out);
 }
 
@@ -458,6 +465,18 @@ static void handle_config()
   if (qarg("current_shaper_data_maxinterval", v)) { scfg.data_maxinterval_s = (uint32_t)v.toInt(); sany = true; }
   if (qarg("current_shaper_min_pause_time", v))   { scfg.min_pause_s = (uint32_t)v.toInt(); sany = true; }
   if (sany) { lite_config_save_shaper(scfg); s_shaperCfg = scfg; }
+
+  LiteMqttConfig mcfg = s_mqttCfg; bool many = false;
+  if (qarg("mqtt_enabled", v)) { mcfg.enabled = v.toInt() != 0; many = true; }
+  if (qarg("mqtt_server", v))  { mcfg.server  = v;              many = true; }
+  if (qarg("mqtt_port", v))    { mcfg.port    = v.toInt();      many = true; }
+  if (qarg("mqtt_topic", v))   { mcfg.topic   = v;              many = true; }
+  if (qarg("mqtt_user", v))    { mcfg.user    = v;              many = true; }
+  if (qarg("mqtt_period", v))  { mcfg.period_s = (uint32_t)v.toInt(); many = true; }
+  // Password: only overwrite when a non-empty value is supplied (qarg requires
+  // length > 0), so re-saving the form with a blank pass preserves the stored one.
+  if (qarg("mqtt_pass", v))    { mcfg.pass    = v;              many = true; }
+  if (many) { lite_config_save_mqtt(mcfg); s_mqttCfg = mcfg; s_mqtt.reconfigure(mcfg); }
 
   int status = 200;
   if (any) {
