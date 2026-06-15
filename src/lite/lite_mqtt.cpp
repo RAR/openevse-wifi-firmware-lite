@@ -13,6 +13,9 @@ void LiteMqtt::begin(const LiteMqttConfig &cfg, const String &shortId, const Str
   _shortId = shortId;
   _fw = fwVersion;
   _mqtt.setBufferSize(LITE_MQTT_BUF);
+  // Cap the blocking connect()/socket so an unreachable broker can't freeze the
+  // shared main loop (WebServer + control) for the 15 s PubSubClient default.
+  _mqtt.setSocketTimeout(4);
   if (_cfg.server.length()) _mqtt.setServer(_cfg.server.c_str(), _cfg.port);
 }
 
@@ -35,6 +38,10 @@ String LiteMqtt::baseTopic() const
 bool LiteMqtt::connectNow()
 {
   if (!_cfg.server.length()) return false;
+  // Re-point at the current config buffer right before use: PubSubClient retains the
+  // bare c_str() pointer from setServer(), so re-validate it here (defends against
+  // _cfg.server being reassigned/moved since begin/reconfigure).
+  _mqtt.setServer(_cfg.server.c_str(), _cfg.port);
   String clientId = String("juicebox-") + _shortId;
   String avail = String(mqtt_topic_join(std::string(baseTopic().c_str()), "available").c_str());
 

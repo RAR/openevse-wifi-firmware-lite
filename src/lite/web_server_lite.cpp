@@ -402,7 +402,7 @@ static void build_status_json(String &out)
 // Serialize the cached config as the canonical /config response body.
 static void config_json(String &out)
 {
-  StaticJsonDocument<640> doc;
+  StaticJsonDocument<1024> doc;   // headroom for long broker host/topic/user values
   doc["max_current_soft"] = s_cfg.max_current_soft;
   doc["max_current_hard"] = s_cfg.max_current_hard;
   doc["divert_enabled"]               = s_divertCfg.enabled;
@@ -469,7 +469,7 @@ static void handle_config()
   LiteMqttConfig mcfg = s_mqttCfg; bool many = false;
   if (qarg("mqtt_enabled", v)) { mcfg.enabled = v.toInt() != 0; many = true; }
   if (qarg("mqtt_server", v))  { mcfg.server  = v;              many = true; }
-  if (qarg("mqtt_port", v))    { mcfg.port    = v.toInt();      many = true; }
+  if (qarg("mqtt_port", v))    { int p = v.toInt(); mcfg.port = (p >= 1 && p <= 65535) ? p : 1883; many = true; }
   if (qarg("mqtt_topic", v))   { mcfg.topic   = v;              many = true; }
   if (qarg("mqtt_user", v))    { mcfg.user    = v;              many = true; }
   if (qarg("mqtt_period", v))  { mcfg.period_s = (uint32_t)v.toInt(); many = true; }
