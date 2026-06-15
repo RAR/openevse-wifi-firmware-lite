@@ -2,15 +2,11 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <stdlib.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include "uri/UriBraces.h"
 
-// IMPORTANT include order: pull in all the C++ / ArduinoJson headers FIRST,
-// then mongoose.h LAST. mongoose.h -> platform_custom.h forces
-// LWIP_COMPAT_SOCKETS=1, which makes lwIP define function-like macros named
-// bind/read/write/send/recv. Those clobber std::bind and the Print/Stream
-// read()/write() method declarations if any C++ header is parsed afterwards.
-// Including them before mongoose keeps the lwIP compat macros scoped to the
-// mongoose code that actually wants the bare socket names.
-#include "lite_evse_backend.h"  // ArduinoJson before mongoose — see above
+#include "lite_evse_backend.h"
 #include "lite_evse_manager.h"
 #include "lite_clock.h"
 #include "lite_energy_totals.h"
@@ -21,8 +17,6 @@
 #include "lite_charge_policy.h"
 #include "lite_override.h"
 #include "lite_schedule.h"
-#include "lite_ws.h"
-#include <WiFi.h>
 #include "lite_openevse_compat.h"
 #include "lite_feed.h"
 #include "lite_divert.h"
@@ -30,32 +24,18 @@
 #include "lite_provision.h"
 #include "web_ui_lite.h"
 
-#include "mongoose.h"
-
-#include "FreeRTOS.h"
-#include "semphr.h"
-
-// MongooseLite's vendored lwIP port (mg_lwip_*) calls mgos_lock/mgos_unlock to
-// guard the per-connection rx_chain pbuf list, shared between the lwIP tcpip
-// thread and the mongoose poll task. The lib stubs them to no-ops off-MGOS; that
-// is a single-threaded assumption that does not hold on our NO_SYS=0 lwIP and
-// double-frees a pbuf under a concurrent scan (see mongoose.c #else note). Back
-// them with a real recursive mutex (recursive: some mongoose paths nest the
-// lock). Created in web_server_lite_begin() before mg_mgr_init.
-static SemaphoreHandle_t s_mgLock = NULL;
-extern "C" void mgos_lock(void)   { if (s_mgLock) xSemaphoreTakeRecursive(s_mgLock, portMAX_DELAY); }
-extern "C" void mgos_unlock(void) { if (s_mgLock) xSemaphoreGiveRecursive(s_mgLock); }
-
 // Reported as OpenEVSE `firmware`/`version` so the HA integration shows a value.
 #ifndef LITE_FW_VERSION
-#define LITE_FW_VERSION "lite-4ws"
+#define LITE_FW_VERSION "lite-web1"
 #endif
 
 // Manual override is defined in main_lite.cpp; reached here for /override + status.
 extern ManualOverride manual;
 
-// Mongoose manager kept static to this TU.
-static struct mg_mgr s_mgr;
+// HTTP server over LibreTiny WiFiServer/WiFiClient = thread-safe lwIP sockets
+// (no raw lwIP from the poll task; no 26 KB single mbuf). One client per
+// handleClient() pass — fine for the single-client setup/dashboard.
+static WebServer s_server(80);
 
 // Live LiteEvseManager handle stashed at begin() (the handler is a C-style callback
 // and cannot capture, so a static pointer is how it reaches device state).
@@ -75,10 +55,6 @@ bool web_server_lite_in_ap_mode(void)     { return s_apMode; }
 static LiteClock        *s_clock  = nullptr;
 static LiteEnergyTotals *s_totals = nullptr;
 static String            s_sntpHost = "pool.ntp.org";
-static unsigned long     s_lastSntpAttemptMs = 0;
-static const unsigned long SNTP_RETRY_MS = 30000;  // re-attempt cadence while unsynced/resync-due
-static const unsigned long WS_PUSH_INTERVAL_MS = 1000;  // /ws status push cadence (~1 Hz)
-static unsigned long       s_lastWsPushMs      = 0;
 
 static LiteDivertState s_divertState = { 0.0 };
 static uint32_t        s_divertLastMs = 0;          // for smoothing delta_s
@@ -175,51 +151,41 @@ static bool schedule_parse(const char *body, size_t len, LiteScheduleEvent &e, i
   return true;
 }
 
-// Parse a trailing /schedule/<id> id from the URI (0 if none).
-static uint32_t schedule_id_from_uri(struct http_message *hm) {
-  const char *pfx = "/schedule/";
-  size_t pl = strlen(pfx);
-  if (hm->uri.len > pl && memcmp(hm->uri.p, pfx, pl) == 0) {
-    return (uint32_t)strtoul(hm->uri.p + pl, NULL, 10);
-  }
-  char idbuf[12];
-  if (mg_get_http_var(&hm->query_string, "id", idbuf, sizeof(idbuf)) > 0)
-    return (uint32_t)strtoul(idbuf, NULL, 10);
-  return 0;
-}
-
-static void handle_schedule(struct mg_connection *nc, struct http_message *hm) {
-  int code = 200;
-  String body;
-  if (mg_vcmp(&hm->method, "POST") == 0) {
+// GET (list) / POST (upsert) / DELETE?id= on the base path.
+static void handle_schedule() {
+  int code = 200; String body;
+  if (s_server.method() == HTTP_POST) {
+    String b = s_server.arg("plain");
     LiteScheduleEvent e;
-    if (schedule_parse(hm->body.p, hm->body.len, e, code)) {
+    if (schedule_parse(b.c_str(), b.length(), e, code)) {
       if (lite_schedule_upsert(s_schedule, e)) {
-        bool saved = lite_config_save_schedule(s_schedule);
-        s_scheduleVersion++;
+        bool saved = lite_config_save_schedule(s_schedule); s_scheduleVersion++;
         code = saved ? 201 : 503;
-        StaticJsonDocument<64> r; r["id"] = e.id;
-        serializeJson(r, body);
-      } else {
-        code = 507; body = "{\"msg\":\"Schedule full\"}";
-      }
-    } else {
-      body = "{\"msg\":\"Bad schedule event\"}";
-    }
-  } else if (mg_vcmp(&hm->method, "DELETE") == 0) {
-    uint32_t id = schedule_id_from_uri(hm);
+        StaticJsonDocument<64> r; r["id"] = e.id; serializeJson(r, body);
+      } else { code = 507; body = "{\"msg\":\"Schedule full\"}"; }
+    } else { body = "{\"msg\":\"Bad schedule event\"}"; }
+  } else if (s_server.method() == HTTP_DELETE) {
+    uint32_t id = 0; String q = s_server.arg("id");
+    if (q.length() > 0) id = (uint32_t)strtoul(q.c_str(), NULL, 10);
     if (id != 0 && lite_schedule_remove(s_schedule, id)) {
-      lite_config_save_schedule(s_schedule);
-      s_scheduleVersion++;
+      lite_config_save_schedule(s_schedule); s_scheduleVersion++;
       body = "{\"msg\":\"Deleted\"}";
-    } else {
-      code = 404; body = "{\"msg\":\"Not found\"}";
-    }
+    } else { code = 404; body = "{\"msg\":\"Not found\"}"; }
   } else {
     schedule_get_json(body);   // GET
   }
-  mg_send_head(nc, code, body.length(), "Content-Type: application/json");
-  mg_printf(nc, "%s", body.c_str());
+  s_server.send(code, "application/json", body);
+}
+
+// DELETE /schedule/<id> (path form) — id from the UriBraces path arg.
+static void handle_schedule_del_path() {
+  int code = 200; String body;
+  uint32_t id = (uint32_t)strtoul(s_server.pathArg(0).c_str(), NULL, 10);
+  if (id != 0 && lite_schedule_remove(s_schedule, id)) {
+    lite_config_save_schedule(s_schedule); s_scheduleVersion++;
+    body = "{\"msg\":\"Deleted\"}";
+  } else { code = 404; body = "{\"msg\":\"Not found\"}"; }
+  s_server.send(code, "application/json", body);
 }
 
 static const char *override_state_str(EvseState s) {
@@ -286,31 +252,23 @@ static void override_get_json(String &out) {
   serializeJson(doc, out);
 }
 
-static void handle_override(struct mg_connection *nc, struct http_message *hm) {
-  int code = 200;
-  String body;
-
-  // Legacy bodyless convenience (same rationale as /config): ?state=active|disabled|
-  // release|clear short-circuits to a claim/release regardless of method.
-  char qstate[12];
-  if (mg_get_http_var(&hm->query_string, "state", qstate, sizeof(qstate)) > 0) {
-    if      (!strcmp(qstate, "active"))   { EvseProperties p(EvseState::Active);   LiteOverrideLimits l; override_apply(p, l); }
-    else if (!strcmp(qstate, "disabled")) { EvseProperties p(EvseState::Disabled); LiteOverrideLimits l; override_apply(p, l); }
-    else if (!strcmp(qstate, "release") || !strcmp(qstate, "clear")) { override_clear(); }
+static void handle_override() {
+  int code = 200; String body;
+  String qs = s_server.arg("state");   // legacy bodyless convenience (any method)
+  if (qs.length() > 0) {
+    if      (qs == "active")   { EvseProperties p(EvseState::Active);   LiteOverrideLimits l; override_apply(p, l); }
+    else if (qs == "disabled") { EvseProperties p(EvseState::Disabled); LiteOverrideLimits l; override_apply(p, l); }
+    else if (qs == "release" || qs == "clear") { override_clear(); }
     override_get_json(body);
-  } else if (mg_vcmp(&hm->method, "POST") == 0) {
-    EvseProperties props;
-    LiteOverrideLimits lim;
-    if (override_parse(hm->body.p, hm->body.len, props, lim)) {
-      override_apply(props, lim);
-      code = 201; body = "{\"msg\":\"Created\"}";
-    } else {
-      code = 400; body = "{\"msg\":\"Failed to parse JSON\"}";
-    }
-  } else if (mg_vcmp(&hm->method, "DELETE") == 0) {
-    override_clear();
-    body = "{\"msg\":\"Deleted\"}";
-  } else if (mg_vcmp(&hm->method, "PATCH") == 0) {
+  } else if (s_server.method() == HTTP_POST) {
+    String b = s_server.arg("plain");
+    EvseProperties props; LiteOverrideLimits lim;
+    if (override_parse(b.c_str(), b.length(), props, lim)) {
+      override_apply(props, lim); code = 201; body = "{\"msg\":\"Created\"}";
+    } else { code = 400; body = "{\"msg\":\"Failed to parse JSON\"}"; }
+  } else if (s_server.method() == HTTP_DELETE) {
+    override_clear(); body = "{\"msg\":\"Deleted\"}";
+  } else if (s_server.method() == HTTP_PATCH) {
     manual.toggle();
     s_ovrLimits = LiteOverrideLimits(); s_ovrExpired = false;
     EvseProperties tp; s_ovrEnabling = manual.getProperties(tp) && tp.getState() == EvseState::Active;
@@ -318,9 +276,7 @@ static void handle_override(struct mg_connection *nc, struct http_message *hm) {
   } else {
     override_get_json(body);   // GET
   }
-
-  mg_send_head(nc, code, body.length(), "Content-Type: application/json");
-  mg_printf(nc, "%s", body.c_str());
+  s_server.send(code, "application/json", body);
 }
 
 // Parse a POST /status JSON body into the pushed-feed store. Each key is optional
@@ -444,238 +400,126 @@ static void config_json(String &out)
   serializeJson(doc, out);
 }
 
-// GET or POST /config[?max_current_soft=N&max_current_hard=M].
-// Params present (on EITHER method) => SET (clamp -> persist -> apply); absent
-// => read current. Accepting the set on GET means no request body is ever
-// required, so bodyless clients work: `curl 'http://ip/config?max_current_soft=20'`,
-// evcc's generic-charger GET URLs, and the HA app all hit it without a body
-// (a no-Content-Length POST otherwise wedges Mongoose waiting for a body).
-static void handle_config(struct mg_connection *nc, struct http_message *hm)
+// Query arg present and non-empty (mirrors the old mg_get_http_var "> 0" gate).
+static bool qarg(const char *k, String &v) { v = s_server.arg(k); return v.length() > 0; }
+
+static void handle_config()
 {
-  char val[8];
+  String v;
   bool any = false;
-  LiteEvseConfig cfg = s_cfg; // start from current, allow partial update
+  LiteEvseConfig cfg = s_cfg;
+  if (qarg("max_current_hard", v)) { cfg.max_current_hard = v.toInt(); any = true; }
+  if (qarg("max_current_soft", v)) { cfg.max_current_soft = v.toInt(); any = true; }
 
-  if (mg_get_http_var(&hm->query_string, "max_current_hard", val, sizeof(val)) > 0) {
-    cfg.max_current_hard = atoi(val);
-    any = true;
-  }
-  if (mg_get_http_var(&hm->query_string, "max_current_soft", val, sizeof(val)) > 0) {
-    cfg.max_current_soft = atoi(val);
-    any = true;
-  }
-
-  char tzbuf[8];
-  if (mg_get_http_var(&hm->query_string, "tz_offset_min", tzbuf, sizeof(tzbuf)) > 0) {
+  if (qarg("tz_offset_min", v)) {
     LiteClockConfig cc; lite_config_load_clock(cc);
-    cc.tz_offset_min = atoi(tzbuf);
-    lite_config_save_clock(cc);
+    cc.tz_offset_min = v.toInt(); lite_config_save_clock(cc);
     if (s_clock) s_clock->setTzOffsetMinutes(cc.tz_offset_min);
   }
-  char hostbuf[48];
-  if (mg_get_http_var(&hm->query_string, "sntp_hostname", hostbuf, sizeof(hostbuf)) > 0) {
+  if (qarg("sntp_hostname", v)) {
     LiteClockConfig cc; lite_config_load_clock(cc);
-    cc.sntp_hostname = hostbuf;
-    lite_config_save_clock(cc);
-    s_sntpHost = hostbuf;
+    cc.sntp_hostname = v.c_str(); lite_config_save_clock(cc);
+    s_sntpHost = v.c_str();
+    // Task 3 adds: sntp_setservername(0, s_sntpHost.c_str());
   }
 
   LiteDivertConfig dcfg = s_divertCfg; bool dany = false;
-  if (mg_get_http_var(&hm->query_string, "divert_enabled", val, sizeof(val)) > 0) { dcfg.enabled = atoi(val) != 0; dany = true; }
-  if (mg_get_http_var(&hm->query_string, "divert_type", val, sizeof(val)) > 0)    { dcfg.type = atoi(val) ? 1 : 0; dany = true; }
-  { char fv[16];
-    if (mg_get_http_var(&hm->query_string, "divert_PV_ratio", fv, sizeof(fv)) > 0)              { dcfg.pv_ratio = atof(fv); dany = true; }
-    if (mg_get_http_var(&hm->query_string, "divert_attack_smoothing_time", fv, sizeof(fv)) > 0) { dcfg.attack_s = (uint32_t)atol(fv); dany = true; }
-    if (mg_get_http_var(&hm->query_string, "divert_decay_smoothing_time", fv, sizeof(fv)) > 0)  { dcfg.decay_s = (uint32_t)atol(fv); dany = true; }
-    if (mg_get_http_var(&hm->query_string, "divert_min_charge_time", fv, sizeof(fv)) > 0)        { dcfg.min_charge_s = (uint32_t)atol(fv); dany = true; }
-  }
+  if (qarg("divert_enabled", v)) { dcfg.enabled = v.toInt() != 0; dany = true; }
+  if (qarg("divert_type", v))    { dcfg.type = v.toInt() ? 1 : 0; dany = true; }
+  if (qarg("divert_PV_ratio", v))              { dcfg.pv_ratio = v.toFloat(); dany = true; }
+  if (qarg("divert_attack_smoothing_time", v)) { dcfg.attack_s = (uint32_t)v.toInt(); dany = true; }
+  if (qarg("divert_decay_smoothing_time", v))  { dcfg.decay_s = (uint32_t)v.toInt(); dany = true; }
+  if (qarg("divert_min_charge_time", v))       { dcfg.min_charge_s = (uint32_t)v.toInt(); dany = true; }
   if (dany) { lite_config_save_divert(dcfg); s_divertCfg = dcfg; }
 
   LiteShaperConfig scfg = s_shaperCfg; bool sany = false;
-  if (mg_get_http_var(&hm->query_string, "current_shaper_enabled", val, sizeof(val)) > 0) { scfg.enabled = atoi(val) != 0; sany = true; }
-  { char fv[16];
-    if (mg_get_http_var(&hm->query_string, "current_shaper_max_pwr", fv, sizeof(fv)) > 0)          { scfg.max_pwr_w = (uint32_t)atol(fv); sany = true; }
-    if (mg_get_http_var(&hm->query_string, "current_shaper_smoothing_time", fv, sizeof(fv)) > 0)   { scfg.smoothing_s = (uint32_t)atol(fv); sany = true; }
-    if (mg_get_http_var(&hm->query_string, "current_shaper_data_maxinterval", fv, sizeof(fv)) > 0) { scfg.data_maxinterval_s = (uint32_t)atol(fv); sany = true; }
-    if (mg_get_http_var(&hm->query_string, "current_shaper_min_pause_time", fv, sizeof(fv)) > 0)   { scfg.min_pause_s = (uint32_t)atol(fv); sany = true; }
-  }
+  if (qarg("current_shaper_enabled", v)) { scfg.enabled = v.toInt() != 0; sany = true; }
+  if (qarg("current_shaper_max_pwr", v))          { scfg.max_pwr_w = (uint32_t)v.toInt(); sany = true; }
+  if (qarg("current_shaper_smoothing_time", v))   { scfg.smoothing_s = (uint32_t)v.toInt(); sany = true; }
+  if (qarg("current_shaper_data_maxinterval", v)) { scfg.data_maxinterval_s = (uint32_t)v.toInt(); sany = true; }
+  if (qarg("current_shaper_min_pause_time", v))   { scfg.min_pause_s = (uint32_t)v.toInt(); sany = true; }
   if (sany) { lite_config_save_shaper(scfg); s_shaperCfg = scfg; }
 
   int status = 200;
   if (any) {
     cfg.max_current_hard = lite_clamp_service_max(cfg.max_current_hard);
     cfg.max_current_soft = lite_clamp_charge_current(cfg.max_current_soft, cfg.max_current_hard);
-
     bool saved = lite_config_save_evse(cfg);
-    // Apply + cache even if persistence failed (best effort).
-    s_cfg = cfg;
+    s_cfg = cfg;   // apply + cache even if persistence failed (best effort)
     if (s_mgr_ctrl) {
       s_mgr_ctrl->setTargetMaxCurrent((uint32_t)cfg.max_current_hard);
       s_mgr_ctrl->setTargetChargeCurrent((uint32_t)cfg.max_current_soft);
     }
-    // 503 signals "applied but not persisted" so the caller knows it won't survive reboot.
-    if (!saved) {
-      status = 503;
-    }
+    if (!saved) status = 503;   // applied but not persisted
   }
 
-  // Always echo the (now-current) clamped config so the caller sees what took effect.
-  String body;
-  config_json(body);
-  mg_send_head(nc, status, body.length(), "Content-Type: application/json");
-  mg_printf(nc, "%s", body.c_str());
+  String body; config_json(body);
+  s_server.send(status, "application/json", body);
 }
 
-// Mongoose SNTP callback: a reply carries unix time as a double in mg_sntp_message.time.
-static void sntp_ev_handler(struct mg_connection *nc, int ev, void *p, void *user_data) {
-  (void)nc; (void)user_data;
-  if (ev == MG_SNTP_REPLY && s_clock) {
-    struct mg_sntp_message *m = (struct mg_sntp_message *)p;
-    s_clock->setEpoch((uint32_t)m->time, millis());
+static void handle_status() {
+  if (s_server.method() == HTTP_POST) {
+    String b = s_server.arg("plain");
+    status_post_apply(b.c_str(), b.length());
+    s_server.send(200, "application/json", "{\"msg\":\"OK\"}");
+  } else {
+    String body; build_status_json(body);
+    s_server.send(200, "application/json", body);
   }
 }
 
-// Push the current /status JSON to every connected WebSocket client. Cheap pre-scan first:
-// build the body only when at least one WS client exists. Connection pointers are never
-// cached across calls (each scan is live), so a client that dropped is simply not seen.
-static int ws_broadcast_status()
-{
-  bool any = false;
-  for (struct mg_connection *c = mg_next(&s_mgr, NULL); c != NULL; c = mg_next(&s_mgr, c)) {
-    if (c->flags & MG_F_IS_WEBSOCKET) { any = true; break; }
-  }
-  if (!any) return 0;
-
-  String body;
-  build_status_json(body);
-  int n = 0;
-  for (struct mg_connection *c = mg_next(&s_mgr, NULL); c != NULL; c = mg_next(&s_mgr, c)) {
-    if (c->flags & MG_F_IS_WEBSOCKET) {
-      mg_send_websocket_frame(c, WEBSOCKET_OP_TEXT, body.c_str(), body.length());
-      n++;
-    }
-  }
-  return n;
-}
-
-// GET /scan — synchronous WiFi scan -> JSON array [{ssid,rssi,enc}]. JSON built
-// here with ArduinoJson (correct escaping of arbitrary SSIDs). Hidden APs (empty
-// SSID) omitted; raw list (GUI dedupes). scanNetworks() returns synchronously
-// (sem-waited) so scanDelete() afterward is safe per the WiFiScan.cpp UAF note.
-static void handle_scan(struct mg_connection *nc)
-{
-  int16_t n = WiFi.scanNetworks();        // blocking; count, or <0 on error
-  // Sized for the 32-entry loop ceiling (~70 B/entry) so a dense RF environment
-  // can't silently drop the user's home AP from the setup-page list. Matches the
-  // stack-doc sizing convention used by schedule_get_json above.
+// GET /scan -> [{ssid,rssi,enc}]. Synchronous scan; scanDelete() after (UAF-safe).
+static void handle_scan() {
+  int16_t n = WiFi.scanNetworks();
   StaticJsonDocument<3072> doc;
   JsonArray arr = doc.to<JsonArray>();
   for (int i = 0; i < n && i < 32; i++) {
     String ssid = WiFi.SSID((uint8_t)i);
-    if (ssid.length() == 0) continue;     // omit hidden
+    if (ssid.length() == 0) continue;   // omit hidden
     JsonObject o = arr.createNestedObject();
     o["ssid"] = ssid;
     o["rssi"] = WiFi.RSSI((uint8_t)i);
     o["enc"]  = lite_provision_enc((int)WiFi.encryptionType((uint8_t)i));
   }
-  WiFi.scanDelete();                      // safe: sync scan already completed
+  WiFi.scanDelete();
   String body; serializeJson(doc, body);
-  mg_send_head(nc, 200, body.length(), "Content-Type: application/json");
-  mg_printf(nc, "%s", body.c_str());
+  s_server.send(200, "application/json", body);
 }
 
-// GET /connect?ssid=<urlenc>&pass=<urlenc> — save creds then schedule a reboot.
-// mg_get_http_var() already URL-decodes (mongoose.c: it calls mg_url_decode), so
-// we store its output directly — no second lite_url_decode pass (that would
-// double-decode legitimate %/+ in a passphrase). pass may be absent (open net).
-static void handle_connect(struct mg_connection *nc, struct http_message *hm)
-{
-  char ssid[64], pass[128];
-  int sl = mg_get_http_var(&hm->query_string, "ssid", ssid, sizeof(ssid));
-  int pl = mg_get_http_var(&hm->query_string, "pass", pass, sizeof(pass));
-  if (sl <= 0) {
-    const char *e = "{\"msg\":\"ssid required\"}";
-    mg_send_head(nc, 400, strlen(e), "Content-Type: application/json");
-    mg_printf(nc, "%s", e);
+// GET /connect?ssid=&pass= -> save creds, 200, then deferred reboot. WebServer
+// URL-decodes args (Parsing.cpp), so store directly — no second decode.
+static void handle_connect() {
+  String ssid = s_server.arg("ssid");
+  String pass = s_server.arg("pass");
+  if (ssid.length() == 0) {
+    s_server.send(400, "application/json", "{\"msg\":\"ssid required\"}");
     return;
   }
   LiteWifiConfig c;
-  c.ssid = ssid;
-  if (pl > 0) c.pass = pass;
+  c.ssid = ssid.c_str();
+  if (pass.length() > 0) c.pass = pass.c_str();
   if (!lite_config_save_wifi(c)) {
-    const char *e = "{\"msg\":\"save failed\"}";
-    mg_send_head(nc, 500, strlen(e), "Content-Type: application/json");
-    mg_printf(nc, "%s", e);
+    s_server.send(500, "application/json", "{\"msg\":\"save failed\"}");
     return;
   }
-  const char *ok = "{\"msg\":\"OK\"}";
-  mg_send_head(nc, 200, strlen(ok), "Content-Type: application/json");
-  mg_printf(nc, "%s", ok);
-  // Reboot from the loop after the response flushes — not here, before drain.
+  s_server.send(200, "application/json", "{\"msg\":\"OK\"}");
   s_rebootPending = true;
-  s_rebootAtMs    = millis() + 750;
+  s_rebootAtMs    = millis() + 750;   // reboot from loop() after the response flushes
 }
 
-// MG_ENABLE_CALLBACK_USERDATA=1 (default in this mongoose build), so handlers
-// take a 4th void* user_data argument.
-static void ev_handler(struct mg_connection *nc, int ev, void *p, void *user_data)
-{
-  (void)user_data;
+// GET / -> gzip bundle for the current mode. Binary-safe: sendContent writes raw
+// bytes (gzip has NULs). Sockets stream it (bounded by TCP_SND_BUF) — no big mbuf.
+static void handle_root() {
+  const uint8_t *body = s_apMode ? SETUP_HTML_GZ : INDEX_HTML_GZ;
+  unsigned len        = s_apMode ? SETUP_HTML_GZ_LEN : INDEX_HTML_GZ_LEN;
+  s_server.sendHeader("Content-Encoding", "gzip");
+  s_server.setContentLength(len);
+  s_server.send(200, "text/html", "");
+  s_server.sendContent((const char *)body, (size_t)len);
+}
 
-  // WebSocket (Slice 3d): push the current /status to a newly-connected client; ignore
-  // inbound frames (the /ws channel is push-only — control stays on HTTP /override etc.).
-  if (ev == MG_EV_WEBSOCKET_HANDSHAKE_DONE) {
-    String body;
-    build_status_json(body);
-    mg_send_websocket_frame(nc, WEBSOCKET_OP_TEXT, body.c_str(), body.length());
-    return;
-  }
-  if (ev == MG_EV_WEBSOCKET_FRAME) {
-    return;
-  }
-  if (ev != MG_EV_HTTP_REQUEST) {
-    return;
-  }
-
-  struct http_message *hm = (struct http_message *)p;
-
-  if (mg_vcmp(&hm->uri, "/status") == 0) {
-    if (mg_vcmp(&hm->method, "POST") == 0) {
-      status_post_apply(hm->body.p, hm->body.len);
-      const char *ok = "{\"msg\":\"OK\"}";
-      mg_send_head(nc, 200, strlen(ok), "Content-Type: application/json");
-      mg_printf(nc, "%s", ok);
-    } else {
-      String body;
-      build_status_json(body);
-      mg_send_head(nc, 200, body.length(), "Content-Type: application/json");
-      mg_printf(nc, "%s", body.c_str());
-    }
-  } else if (mg_vcmp(&hm->uri, "/config") == 0) {
-    handle_config(nc, hm);
-  } else if (mg_vcmp(&hm->uri, "/override") == 0) {
-    handle_override(nc, hm);
-  } else if ((hm->uri.len == 9  && memcmp(hm->uri.p, "/schedule", 9)  == 0) ||
-             (hm->uri.len > 10 && memcmp(hm->uri.p, "/schedule/", 10) == 0)) {
-    handle_schedule(nc, hm);
-  } else if (mg_vcmp(&hm->uri, "/scan") == 0) {
-    handle_scan(nc);
-  } else if (mg_vcmp(&hm->uri, "/connect") == 0) {
-    handle_connect(nc, hm);
-  } else if (mg_vcmp(&hm->uri, "/") == 0) {
-    // Serve the gzipped bundle for the current mode. mg_send (binary-safe) — NOT
-    // mg_printf — because gzip data contains NUL bytes that "%s" would truncate.
-    const uint8_t *body = s_apMode ? SETUP_HTML_GZ : INDEX_HTML_GZ;
-    unsigned len        = s_apMode ? SETUP_HTML_GZ_LEN : INDEX_HTML_GZ_LEN;
-    mg_send_head(nc, 200, len, "Content-Type: text/html\r\nContent-Encoding: gzip");
-    mg_send(nc, body, (int)len);
-  } else {
-    const char *body = "not found";
-    mg_send_head(nc, 404, strlen(body), "Content-Type: text/plain");
-    mg_printf(nc, "%s", body);
-  }
-
-  nc->flags |= MG_F_SEND_AND_CLOSE;
+static void handle_not_found() {
+  s_server.send(404, "text/plain", "not found");
 }
 
 void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTotals &totals)
@@ -705,31 +549,22 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
   lite_config_load_divert(s_divertCfg);   // keeps defaults if the key is absent
   lite_config_load_shaper(s_shaperCfg);  // keeps defaults if the key is absent
 
-  // Back mgos_lock/unlock before the manager (and thus the lwIP port shim) exist.
-  if (!s_mgLock) {
-    s_mgLock = xSemaphoreCreateRecursiveMutex();
-  }
-
-  mg_mgr_init(&s_mgr, NULL);
-  // mg_bind takes (mgr, addr, handler, user_data) when MG_ENABLE_CALLBACK_USERDATA=1.
-  // No Serial.print on failure — Serial is the JuiceBox $-protocol line this slice.
-  struct mg_connection *c = mg_bind(&s_mgr, "80", ev_handler, NULL);
-  if (c) {
-    mg_set_protocol_http_websocket(c);
-  }
+  s_server.on("/", handle_root);
+  s_server.on("/status", handle_status);
+  s_server.on("/config", handle_config);
+  s_server.on("/override", handle_override);
+  s_server.on("/schedule", handle_schedule);
+  s_server.on(UriBraces("/schedule/{}"), HTTP_DELETE, handle_schedule_del_path);
+  s_server.on("/scan", handle_scan);
+  s_server.on("/connect", handle_connect);
+  s_server.onNotFound(handle_not_found);
+  s_server.begin();
+  // Task 3 adds lwIP SNTP init here.
 }
-
-// Reap connections wedged open by an incomplete request — e.g. a POST with no
-// Content-Length, where Mongoose waits forever for a body that never arrives.
-// Left unchecked these accumulate and exhaust the connection pool (symptom: the
-// server stops answering even GETs). A normal request/response on this server
-// lasts milliseconds, so any non-listening connection idle past this window is
-// stuck. mg_time() is wall-clock seconds; last_io_time updates on each socket IO.
-static const double LITE_CONN_IDLE_SECS = 10.0;
 
 void web_server_lite_loop()
 {
-  mg_mgr_poll(&s_mgr, 0);
+  s_server.handleClient();
 
   // Deferred post-/connect reboot: fires once the queued instant has passed, so
   // the {"msg":"OK"} response has been polled out before the radio resets.
@@ -875,30 +710,6 @@ void web_server_lite_loop()
   } else if (s_mgr_ctrl && s_mgr_ctrl->clientHasClaim(EvseClient_OpenEVSE_Divert)) {
     s_mgr_ctrl->release(EvseClient_OpenEVSE_Divert);   // divert turned off -> drop the claim
     s_divertState.smoothed_available = 0;
-  }
-
-  // Slice 3d: push /status to WebSocket clients at ~1 Hz (only when any are connected;
-  // ws_broadcast_status() does a cheap pre-scan and skips the JSON build otherwise).
-  if (lite_ws_should_push(millis(), s_lastWsPushMs, WS_PUSH_INTERVAL_MS)) {
-    ws_broadcast_status();
-    s_lastWsPushMs = millis();
-  }
-
-  unsigned long nowMs = millis();
-  if (s_clock && s_clock->resyncDue(nowMs) &&
-      (nowMs - s_lastSntpAttemptMs) >= SNTP_RETRY_MS) {
-    s_lastSntpAttemptMs = nowMs;
-    mg_sntp_get_time(&s_mgr, sntp_ev_handler, s_sntpHost.c_str(), NULL);
-  }
-
-  double now = mg_time();
-  struct mg_connection *c, *tmp;
-  for (c = mg_next(&s_mgr, NULL); c != NULL; c = tmp) {
-    tmp = mg_next(&s_mgr, c); // fetch next before a possible close invalidates c
-    if (!(c->flags & MG_F_LISTENING) && !(c->flags & MG_F_IS_WEBSOCKET) &&
-        (now - (double)c->last_io_time) > LITE_CONN_IDLE_SECS) {
-      c->flags |= MG_F_CLOSE_IMMEDIATELY;
-    }
   }
 }
 #endif
