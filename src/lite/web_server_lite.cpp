@@ -28,7 +28,7 @@
 
 // Reported as OpenEVSE `firmware`/`version` so the HA integration shows a value.
 #ifndef LITE_FW_VERSION
-#define LITE_FW_VERSION "lite-web1"
+#define LITE_FW_VERSION "lite-web2"
 #endif
 
 // Manual override is defined in main_lite.cpp; reached here for /override + status.
@@ -360,6 +360,7 @@ void web_server_lite_build_status(JsonDocument &doc)
   // Identity / system.
   doc["firmware"]  = LITE_FW_VERSION;
   doc["version"]   = LITE_FW_VERSION;
+  doc["ota_bank"]  = lt_ota_dual_get_current();   // 1 = bank A (@0x008000), 2 = bank B (@0x100000)
   { IPAddress ip = WiFi.localIP();
     char ipbuf[16];
     snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
@@ -547,6 +548,63 @@ static void handle_connect() {
   s_rebootAtMs    = millis() + 750;   // reboot from loop() after the response flushes
 }
 
+// POST /update — OTA firmware upload. Streams the dual-bank .uf2 bytes straight into
+// the LibreTiny uf2ota engine via the low-level lt_ota_* API (NOT the Arduino Update
+// wrapper: Update.cpp pulls an MD5 impl that silabs-efm32gg11 deliberately disables —
+// LT_ARD_MD5_MBEDTLS 0, no mbedtls md5 in this core — and we don't use Update's optional
+// MD5 check anyway). uf2ota parses the UF2 blocks, writes the INACTIVE bank, and on
+// lt_ota_end() activates it as a TRIAL. On success we schedule the shared deferred reboot
+// so the JSON reply flushes first; the new image self-confirms from loop() once it's live
+// (lite_ota_should_confirm), else the bootloader auto-reverts after 3 boots. No auth,
+// matching every other lite endpoint.
+static bool          s_otaOk  = false;
+static String        s_otaErr;
+static lt_ota_ctx_t *s_otaCtx = nullptr;
+static void handle_update_upload() {
+  HTTPUpload &up = s_server.upload();
+  if (up.status == UPLOAD_FILE_START) {
+    s_otaErr = ""; s_otaOk = false;
+    if (s_otaCtx) { lt_ota_end(s_otaCtx); free(s_otaCtx); s_otaCtx = nullptr; }   // stale ctx
+    s_otaCtx = (lt_ota_ctx_t *)malloc(sizeof(lt_ota_ctx_t));
+    if (!s_otaCtx) { s_otaErr = "alloc"; return; }
+    lt_ota_begin(s_otaCtx, 0);   // size unknown — UF2 blocks are self-delimiting
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (s_otaCtx && s_otaErr.length() == 0 &&
+        lt_ota_write(s_otaCtx, up.buf, up.currentSize) != up.currentSize) {
+      s_otaErr = String("uf2 write err ") + (int)s_otaCtx->error;
+    }
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (s_otaCtx && s_otaErr.length() == 0) {
+      // Success requires BOTH a clean end AND that a real, complete image was written:
+      // bytes_written>0 rejects an empty/too-small POST (e.g. a few non-UF2 bytes that
+      // never form a 512B block), and error==UF2_ERR_OK rejects a malformed/partial UF2.
+      // Without this guard a garbage upload returned ok + triggered a pointless reboot.
+      bool ended = lt_ota_end(s_otaCtx);
+      if (ended && s_otaCtx->error == UF2_ERR_OK && s_otaCtx->bytes_written > 0) {
+        s_otaOk = true;
+      } else {
+        s_otaErr = String("incomplete/invalid image (err ") + (int)s_otaCtx->error +
+                   ", wrote " + (unsigned)s_otaCtx->bytes_written + "B)";
+      }
+    }
+    if (s_otaCtx) { free(s_otaCtx); s_otaCtx = nullptr; }
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    if (s_otaCtx) { lt_ota_end(s_otaCtx); free(s_otaCtx); s_otaCtx = nullptr; }
+    s_otaErr = "aborted";
+  }
+}
+static void handle_update_done() {
+  StaticJsonDocument<128> doc;
+  doc["ok"] = s_otaOk;
+  if (!s_otaOk) doc["error"] = s_otaErr.length() ? s_otaErr : String("unknown");
+  String out; serializeJson(doc, out);
+  s_server.send(s_otaOk ? 200 : 400, "application/json", out);
+  if (s_otaOk) {
+    s_rebootPending = true;
+    s_rebootAtMs    = millis() + 750;   // reboot from loop() after the response flushes
+  }
+}
+
 // GET / -> gzip bundle for the current mode. Binary-safe: sendContent writes raw
 // bytes (gzip has NULs). Sockets stream it (bounded by TCP_SND_BUF) — no big mbuf.
 static void handle_root() {
@@ -600,6 +658,7 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
   s_server.on(UriBraces("/schedule/{}"), HTTP_DELETE, handle_schedule_del_path);
   s_server.on("/scan", handle_scan);
   s_server.on("/connect", handle_connect);
+  s_server.on("/update", HTTP_POST, handle_update_done, handle_update_upload);
   s_server.onNotFound(handle_not_found);
   s_server.begin();
   sntp_setoperatingmode(SNTP_OPMODE_POLL);

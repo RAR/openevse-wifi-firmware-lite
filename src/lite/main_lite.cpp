@@ -71,6 +71,13 @@ void setup()
 
   lite_config_begin();              // mount FlashDB KVDB (kvs partition) FIRST — creds live here now
 
+  // OTA self-confirm: mark a freshly-OTA'd TRIAL bank healthy so it sticks (else the
+  // bootloader auto-reverts after 3 boots). lt_ota_confirm() is idempotent (libretiny
+  // feature/silabs-efm32gg11-ota ed495b5): a no-op that touches no flash unless the running
+  // bank is a genuine unconfirmed TRIAL. Called here — early, BEFORE WF200 bring-up — so the
+  // one real post-OTA metadata write happens with the radio idle (no WiFi-link blip).
+  lt_ota_confirm();
+
   // Stored-only creds (D1). Try them with a bounded connect; on no-creds or a
   // connect that doesn't land within LITE_STA_CONNECT_TIMEOUT_MS, fall to an open
   // softAP at 192.168.4.1 with SSID OpenEVSE-Lite-<shortid> (D2). The wait loop is
