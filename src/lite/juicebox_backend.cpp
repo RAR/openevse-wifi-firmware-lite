@@ -20,6 +20,10 @@ static const unsigned long JB_KEEPALIVE_INTERVAL_MS = 15000;
 // ping interval with margin without flapping; a real dead controller still trips
 // offline within ~90 s. Bump toward ~130 s if we ever need to ride out a missed ping.
 static const unsigned long JB_OFFLINE_TIMEOUT_MS    = 90000;
+// How often to re-assert the active setpoint (~AL/~OL/~LK) + poll status (~ES). The OEM
+// re-asserts ~AL ~every 63 s; 15 s keeps our commanded limit fresh and status current
+// without flooding the shared UART. Setpoint CHANGES are sent immediately (see _cmdDirty).
+static const unsigned long JB_CMD_INTERVAL_MS       = 15000;
 
 void JuiceBoxBackend::begin() {
   _lastBeatMillis = millis();
@@ -60,12 +64,39 @@ void JuiceBoxBackend::loop() {
   }
 
   unsigned long now = millis();
+
+  // After identity, run the stock-style handshake ONCE: announce protocol version, query
+  // identity/status (empty-payload ~FW/~HW/~CR/~ES -> the MCU replies $FW/$HW/$CR/$ES, which
+  // handleFrame() parses), then push the initial setpoints. Mirrors the OEM WiFi module
+  // (captured 2026-06-17); every frame carries the required CRC trailer (juicebox_build_*).
+  if (_identified && !_handshakeDone) {
+    sendFrame("PV", "20");
+    sendFrame("FW", nullptr);
+    sendFrame("HW", nullptr);
+    sendFrame("CR", nullptr);
+    sendFrame("ES", nullptr);
+    sendSetpoints();
+    _handshakeDone = true;
+    _cmdDirty      = false;
+    _lastCmdMillis = now;
+  }
+
   // Keepalive holds the comm watchdog via a '~'-channel heartbeat (see sendKeepalive) —
   // matching how the stock module keeps the MCU online. Gated on _everRx so we don't
   // transmit into a silent line.
   if (_everRx && (now - _lastBeatMillis) >= JB_KEEPALIVE_INTERVAL_MS) {
     sendKeepalive();
     _lastBeatMillis = now;
+  }
+
+  // Drive the MCU: re-assert the active setpoint (~AL current / ~OL fallback / ~LK gate) and
+  // poll status (~ES). Sent immediately on a setpoint change (_cmdDirty) and periodically
+  // re-asserted. This is what actually sets charge current / start-stop on the controller.
+  if (_handshakeDone && (_cmdDirty || (now - _lastCmdMillis) >= JB_CMD_INTERVAL_MS)) {
+    sendSetpoints();
+    sendFrame("ES", nullptr);
+    _cmdDirty      = false;
+    _lastCmdMillis = now;
   }
 }
 
@@ -154,6 +185,34 @@ void JuiceBoxBackend::sendKeepalive() {
   _port.print("~MDNFO:V1:65535/A1:65535\n");   // LF only, matching the OEM line terminator
 #ifdef JB_DEBUG
   LT_I("JBTX(~): #MDNFO:V1:65535/A1:65535  (~ keepalive)");
+#endif
+}
+
+// Build a CRC-trailered WiFi->MCU command frame and write it to the UART (LF-terminated,
+// matching the OEM). payload == nullptr / "" makes the empty-payload query form (~XX000:).
+void JuiceBoxBackend::sendFrame(const char *type, const char *payload) {
+  char buf[48];
+  if (juicebox_build_frame(type, payload, buf, sizeof(buf))) {
+    _port.print(buf);
+    _port.print('\n');
+#ifdef JB_DEBUG
+    char safe[48]; jb_log_safe(safe, sizeof(safe), buf);   // obscure '$' (none here, but safe)
+    LT_I("JBTX(~): %s", safe);
+#endif
+  }
+}
+
+// Push the active setpoint to the MCU: ~AL (active current limit, the J1772 charge gate),
+// ~OL (offline/fallback limit, mirrored), ~LK (lock: 00=enable/charge, 01=stop). Driven by
+// the EVSE manager via setChargeCurrent()/setState(); amps clamped to [0,79] in the builder.
+void JuiceBoxBackend::sendSetpoints() {
+  int amps = _chargeLimit < 0 ? 0 : _chargeLimit;
+  char buf[48];
+  if (juicebox_build_amps_set(amps, buf, sizeof(buf)))      { _port.print(buf); _port.print('\n'); }
+  if (juicebox_build_offline_limit(amps, buf, sizeof(buf))) { _port.print(buf); _port.print('\n'); }
+  if (juicebox_build_lock(!_enabled, buf, sizeof(buf)))     { _port.print(buf); _port.print('\n'); }
+#ifdef JB_DEBUG
+  LT_I("JBTX(~): ~AL/~OL=%d ~LK=%s", amps, _enabled ? "00(enable)" : "01(stop)");
 #endif
 }
 

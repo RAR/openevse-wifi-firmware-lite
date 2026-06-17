@@ -20,17 +20,16 @@ public:
   int  getPower() const override { return _status.power; }
   int  getTemp()  const override { return _status.temp; }
   int  getFault() const override { return getState() == LiteEvseState::Error ? 1 : 0; }
-  // Sets the keepalive's advertised charge current. The Atmel further clamps to
-  // its 6 A floor / <81 A ceiling; host-side policy lives in lite_charge_policy.
-  void setChargeCurrent(int amps) override { _chargeLimit = amps; }
+  // Sets the active-limit (~AL) charge current sent to the MCU. The Atmel further clamps to
+  // its 6 A floor / <81 A ceiling; host-side policy lives in lite_charge_policy. Marks the
+  // command dirty so loop() pushes it immediately.
+  void setChargeCurrent(int amps) override { _chargeLimit = amps; _cmdDirty = true; }
   // Distinct from getAmps() (the Atmel's reported max/rating in $ES field A).
   int  getChargeCurrent() const override { return _chargeLimit; }
-  // Disabled => stop. The stop command IS known (RE-confirmed): commanding the active
-  // limit < 6 A (we send 0 via the keepalive) clears the MCU's charge-enable gate so the
-  // J1772 pilot reverts to its non-charging state and the EV stops. _enabled gates the
-  // keepalive's advertised amps (see sendKeepalive). HW-validation of the stop pending a
-  // complete unit (the bench unit hard-faults on GFI and won't charge).
-  void setState(EvseState s) override { _enabled = (s != EvseState::Disabled); }
+  // Disabled => stop via the ~LK lock gate (01=lock/stop, 00=unlock/enable) — the real
+  // start/stop control confirmed on the wire 2026-06-17, sent by sendSetpoints(). Marks the
+  // command dirty so loop() pushes the lock change immediately.
+  void setState(EvseState s) override { _enabled = (s != EvseState::Disabled); _cmdDirty = true; }
   bool isCharging() const override { return juicebox_map_state(_status.state) == LiteEvseState::Charging; }
   int  getMinCurrent() const override { return 6; }
   int  getMaxHardwareCurrent() const override { return _maxHwCurrent; }
@@ -43,6 +42,8 @@ public:
 private:
   void handleFrame(const JuiceBoxFrame &f);
   void sendKeepalive();
+  void sendFrame(const char *type, const char *payload);   // CRC-trailered ~ command/query
+  void sendSetpoints();                                     // ~AL current / ~OL fallback / ~LK gate
 
   Stream        &_port;
   JuiceBoxParser _parser;
@@ -59,7 +60,10 @@ private:
   // rx_overflow climbing = the receive ring can't keep up (TX/log contention on the UART).
   unsigned long  _rxFrames      = 0;
   unsigned long  _rxOverflows   = 0;
-  bool           _identified    = false;   // sent ~MDNFO identify on the ~ channel once
+  bool           _identified    = false;   // sent ~MDCRI identify on the ~ channel once
+  bool           _handshakeDone  = false;  // sent the one-shot ~PV/query/setpoint handshake
+  bool           _cmdDirty       = true;   // setpoint changed -> push ~AL/~OL/~LK next loop
+  unsigned long  _lastCmdMillis  = 0;      // last ~AL/~OL/~LK re-assert + ~ES poll
   // Charge-current limit (A) advertised by the keepalive. Safe 6 A J1772 floor by default;
   // a future control feature will make this settable. NEVER auto-track the MCU's reported max.
   int            _chargeLimit    = 6;
