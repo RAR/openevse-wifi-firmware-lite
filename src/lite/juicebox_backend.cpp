@@ -145,11 +145,12 @@ void JuiceBoxBackend::sendKeepalive() {
   // (~MDNFO:V1:65535/A1:65535 — meter sentinel, 65535 = no meter). Any assembled line
   // clears the ATmega's offline bit (0xa14, common path) so this holds the comm watchdog
   // online exactly like the OEM did, and it carries the "~MDNFO" substring the MCU sniffs
-  // for WiFi-module presence (strstr @0x6790). This REPLACES the old $AL keepalive: the
+  // for WiFi-module presence (strstr @0x6790). This REPLACES the old keepalive idea: the
   // OEM keeps the MCU alive purely via '~' chatter (its console shows no '$' frames).
-  // The $AL amps-set (juicebox_build_amps_set) is the separate charge-current command,
-  // sent on demand when we actually drive current — not the heartbeat. (UNVALIDATED for
-  // charging: GFI HW self-test gates that on this bench regardless. See protocol notes.)
+  // The ~AL amps-set (juicebox_build_amps_set) is the separate charge-current command, and
+  // ~LK (juicebox_build_lock) the start/stop gate — both now carry the required CRC trailer
+  // and are sent on demand when we drive current, not as the heartbeat. (Charge control still
+  // UNVALIDATED on HW: the GFI/No-GND self-test gates the contactor on this bench regardless.)
   _port.print("~MDNFO:V1:65535/A1:65535\n");   // LF only, matching the OEM line terminator
 #ifdef JB_DEBUG
   LT_I("JBTX(~): #MDNFO:V1:65535/A1:65535  (~ keepalive)");

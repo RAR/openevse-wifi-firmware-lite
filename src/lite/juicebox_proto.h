@@ -75,13 +75,29 @@ bool juicebox_parse_es(const char *payload, uint16_t len, JuiceBoxStatus &out);
 // vehicle"; distinguishing Connected needs the H pilot-voltage field (follow-up).
 LiteEvseState juicebox_map_state(int raw);
 
-// Build "$<type><LLL hex>:<payload>" into buf. Returns bytes written, 0 on overflow.
+// --- Frame checksum (custom hash @ ATmega flash 0x4998) -------------------------
+// Verified byte-exact against 23 captured stock frames in both directions
+// (2026-06-17 dual-UART tap). The hash covers the whole frame INCLUDING the leading
+// $/~ prefix, up to (not including) the trailer. Reference: crc_codec.py.
+uint16_t juicebox_crc(const char *data, size_t len);
+// Encode a checksum as the 3-char base-0x3C trailer (out gets 3 chars + NUL).
+void     juicebox_encode_trailer(uint16_t crc, char out[4]);
+
+// Build a WiFi->MCU command frame "~<type><LLL hex>:<payload>:<trailer>:" into buf.
+// The '~' prefix and trailer checksum are required for the MCU to accept the command
+// (CONFIRMED on the wire 2026-06-17). Returns bytes written, 0 on overflow.
 size_t juicebox_build_frame(const char *type, const char *payload, char *buf, size_t buflen);
 
-// Build the host->MCU amps-set command into buf ("$<type>002:NN"). Doubles as the
-// comm-watchdog keepalive: re-sending the MCU's reported amps is an idempotent no-op
-// that holds it online. `amps` is clamped to [0,79] (the MCU rejects >= 80).
+// Build the host->MCU amps-set command "~AL002:NN:<trailer>:" (active current limit,
+// the J1772 charge gate). `amps` is clamped to [0,79] (the MCU rejects >= 80).
 // Returns bytes written, 0 on overflow.
-// NOTE: the command TYPE bytes are UNCONFIRMED (need a live UART capture); see
-// docs/superpowers/notes/2026-06-13-juicebox-protocol-re.md.
 size_t juicebox_build_amps_set(int amps, char *buf, size_t buflen);
+
+// Build the host->MCU lock command "~LK002:NN:<trailer>:" — true=lock (stop charging,
+// "01"), false=unlock (enable, "00"). The charge START/STOP gate stock drives, separate
+// from the AL setpoint. Returns bytes written, 0 on overflow.
+size_t juicebox_build_lock(bool locked, char *buf, size_t buflen);
+
+// Build the host->MCU offline-limit command "~OL002:NN:<trailer>:" (fallback current if
+// comms drop). `amps` clamped to [0,79]. Returns bytes written, 0 on overflow.
+size_t juicebox_build_offline_limit(int amps, char *buf, size_t buflen);

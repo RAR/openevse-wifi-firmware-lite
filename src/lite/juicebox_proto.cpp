@@ -122,22 +122,67 @@ bool JuiceBoxParser::feed(uint8_t b, JuiceBoxFrame &out) {
   return false;
 }
 
+// --- Frame checksum -------------------------------------------------------------
+// Custom hash reversed from the ATmega image (routine @ flash 0x4998); NOT a standard
+// polynomial CRC. Verified byte-exact against 23 captured stock frames in BOTH
+// directions (2026-06-17 dual-UART tap; see device-configs .../crc_codec.py). The
+// hash covers the whole frame INCLUDING the leading $/~ prefix, up to (not incl.) the
+// trailer. The stock WiFi rejects frames with a wrong/missing trailer ("Inv EVSE msg
+// ... CRC"), so our commands MUST carry it to be accepted.
+static inline uint8_t jb_swapn(uint8_t b) { return (uint8_t)((b << 4) | (b >> 4)); }
+
+uint16_t juicebox_crc(const char *data, size_t len) {
+  uint16_t crc = 0;
+  for (size_t i = 0; i < len; ++i) {
+    uint8_t  d    = (uint8_t)data[i];
+    uint16_t t    = (uint16_t)(crc >> 2);
+    uint16_t u    = (uint16_t)(crc << 1);
+    uint8_t  sulo = jb_swapn((uint8_t)(u & 0xFF));
+    uint8_t  suhi = jb_swapn((uint8_t)(u >> 8));
+    uint8_t  hi   = (uint8_t)((suhi & 0xF0) ^ (sulo & 0x0F));
+    uint8_t  lo   = (uint8_t)(sulo & 0xF0);
+    uint16_t val  = (uint16_t)(((uint16_t)hi << 8) | lo);
+    val = (uint16_t)(val + t);
+    int sd = (d & 0x80) ? (int)d - 256 : (int)d;   // data byte added as SIGNED int8
+    val = (uint16_t)(val + sd);
+    crc ^= val;
+  }
+  return crc;
+}
+
+// Encode the 16-bit checksum as the 3-char base-0x3C trailer (encoder @ flash 0xf3e),
+// MSB first, with the +bit11/+bit5 injection the ATmega applies. out gets 3 chars + NUL.
+void juicebox_encode_trailer(uint16_t crc, char out[4]) {
+  out[0] = (char)(0x3C + ((crc >> 12) & 0x0F));
+  out[1] = (char)(0x3C + ((crc >> 6)  & 0x3F) + ((crc >> 11) & 1));
+  out[2] = (char)(0x3C + ( crc        & 0x3F) + ((crc >> 5)  & 1));
+  out[3] = '\0';
+}
+
+// Build a WiFi->MCU command frame "~<TT><LLL>:<payload>:<trailer>:" into buf. The '~'
+// prefix is the WiFi-module->safety-MCU direction (CONFIRMED on the wire 2026-06-17;
+// stock sends ~AL/~OL/~LK, never '$' or 'SL'). The trailer is the required checksum.
+// Returns bytes written, 0 on overflow.
 size_t juicebox_build_frame(const char *type, const char *payload, char *buf, size_t buflen) {
   if (!type || strlen(type) != JB_TYPE_LEN) return 0;
   size_t plen = payload ? strlen(payload) : 0;
   if (plen > 0xFFF) return 0;
-  size_t need = 1 + JB_TYPE_LEN + 3 + 1 + plen + 1;   // $ TT LLL : payload NUL
+  // ~ TT LLL : payload : XXX :  + NUL
+  size_t need = 1 + JB_TYPE_LEN + 3 + 1 + plen + 1 + 3 + 1 + 1;
   if (buflen < need) return 0;
-  int n = snprintf(buf, buflen, "$%s%03X:%s", type, (unsigned)plen, payload ? payload : "");
-  return (n > 0 && (size_t)n < buflen) ? (size_t)n : 0;
+  int bn = snprintf(buf, buflen, "~%s%03X:%s", type, (unsigned)plen, payload ? payload : "");
+  if (bn <= 0 || (size_t)bn >= buflen) return 0;
+  char tr[4];
+  juicebox_encode_trailer(juicebox_crc(buf, (size_t)bn), tr);   // CRC covers "~TTLLL:payload"
+  int fn = snprintf(buf + bn, buflen - (size_t)bn, ":%s:", tr);
+  if (fn <= 0 || (size_t)(bn + fn) >= buflen) return 0;
+  return (size_t)(bn + fn);
 }
 
-// Host->MCU set-active-limit command. CONFIRMED "AL" by full disasm of the running
-// ATmega image (SERIAL_PROTOCOL.md): dispatch arm @0x14e0 routes "AL" -> set-value
-// handler (writes the active current limit RAM 0x519, the J1772 charge gate). There is
-// NO 'S'-prefixed command anywhere in the firmware — the earlier "SL" was a wrong guess
-// and was silently dropped at dispatch (it reset the comm watchdog but set nothing).
-// "OL" is the offline-limit sibling (first char selects the target). Sent unsolicited.
+// Host->MCU set-active-limit command "~AL002:NN:<trailer>:". CONFIRMED "AL" by disasm
+// (dispatch @0x14e0 -> active current limit RAM 0x519, the J1772 charge gate) AND on the
+// wire (stock sends ~AL002:NN). NO 'SL' exists; the old guess set nothing. amps clamped
+// to [0,79] (MCU rejects >= 80). Returns bytes written, 0 on overflow.
 static const char JB_AMPS_CMD_TYPE[] = "AL";
 
 size_t juicebox_build_amps_set(int amps, char *buf, size_t buflen) {
@@ -146,4 +191,21 @@ size_t juicebox_build_amps_set(int amps, char *buf, size_t buflen) {
   char payload[3];
   snprintf(payload, sizeof(payload), "%02d", amps);
   return juicebox_build_frame(JB_AMPS_CMD_TYPE, payload, buf, buflen);
+}
+
+// Host->MCU lock command "~LK002:NN:<trailer>:" — 01=lock (stop), 00=unlock (enable).
+// This is the charge START/STOP gate the stock module drives (HW-RE 2026-06-17), distinct
+// from the AL current setpoint. Returns bytes written, 0 on overflow.
+size_t juicebox_build_lock(bool locked, char *buf, size_t buflen) {
+  return juicebox_build_frame("LK", locked ? "01" : "00", buf, buflen);
+}
+
+// Host->MCU offline-limit command "~OL002:NN:<trailer>:" — the fallback current the MCU
+// applies if WiFi comms drop. amps clamped to [0,79]. Returns bytes written, 0 on overflow.
+size_t juicebox_build_offline_limit(int amps, char *buf, size_t buflen) {
+  if (amps < 0)  amps = 0;
+  if (amps > 79) amps = 79;
+  char payload[3];
+  snprintf(payload, sizeof(payload), "%02d", amps);
+  return juicebox_build_frame("OL", payload, buf, buflen);
 }

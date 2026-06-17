@@ -109,49 +109,57 @@ TEST_CASE("maps hex JB state codes to canonical states (SERIAL_PROTOCOL.md §2a)
   CHECK(juicebox_map_state(0x99) == LiteEvseState::Unknown);
 }
 
-TEST_CASE("build_frame emits $<type><3hex len>:<payload>") {
-  char buf[64];
-  size_t n = juicebox_build_frame("PV", "20", buf, sizeof(buf));
-  REQUIRE(n > 0);
-  CHECK(strcmp(buf, "$PV002:20") == 0);
+TEST_CASE("frame checksum reproduces captured stock trailers (both directions)") {
+  // (frame-without-trailer, expected 3-char trailer) — verbatim from the 2026-06-17
+  // dual-UART capture (20260617-134204-dualtap-merged.log). The CRC covers the $/~ prefix.
+  struct { const char *frame; const char *trailer; } v[] = {
+    {"~AL002:40", ">Oz"}, {"~OL002:40", "AzL"}, {"~LK002:00", "CiT"},
+    {"~PV002:20", "?CV"}, {"~ES000:", "@{S"}, {"~LK002:01", nullptr},
+    {"$ES01C:S05,L01,T00,H40,A40,P100,F40", "GNf"},
+    {"$WR00B:003:No GND", ">jJ"}, {"$FW006:100102", "HJP"},
+  };
+  for (auto &e : v) {
+    if (!e.trailer) continue;   // ~LK002:01 has no captured trailer; covered by build test
+    char tr[4];
+    juicebox_encode_trailer(juicebox_crc(e.frame, strlen(e.frame)), tr);
+    CHECK(strcmp(tr, e.trailer) == 0);
+  }
 }
 
-TEST_CASE("build_frame round-trips through the parser") {
+TEST_CASE("build_frame emits ~<type><3hex len>:<payload>:<crc>: byte-exact vs stock") {
   char buf[64];
-  REQUIRE(juicebox_build_frame("ES", "S00,A00", buf, sizeof(buf)) > 0);
-  char line[80]; snprintf(line, sizeof(line), "%s\r", buf);
-  JuiceBoxParser p; JuiceBoxFrame f; bool got = false;
-  for (char *c = line; *c; ++c) if (p.feed((uint8_t)*c, f)) got = true;
-  REQUIRE(got);
-  CHECK(strcmp(f.type, "ES") == 0);
-  CHECK(strcmp(f.payload, "S00,A00") == 0);
+  REQUIRE(juicebox_build_frame("PV", "20", buf, sizeof(buf)) > 0);
+  CHECK(strcmp(buf, "~PV002:20:?CV:") == 0);
 }
 
 TEST_CASE("build_frame refuses an undersized buffer") {
-  char buf[4];
+  char buf[8];   // need 15 for ~PV002:20:?CV:\0
   CHECK(juicebox_build_frame("PV", "20", buf, sizeof(buf)) == 0);
 }
 
-TEST_CASE("amps-set builds a 2-digit payload and round-trips") {
+TEST_CASE("amps-set is byte-exact vs the captured stock ~AL002:40 frame") {
   char buf[32];
-  size_t n = juicebox_build_amps_set(24, buf, sizeof(buf));
-  REQUIRE(n > 0);
-  char line[40]; snprintf(line, sizeof(line), "%s\r", buf);
-  JuiceBoxParser p; JuiceBoxFrame f; bool got = false;
-  for (char *c = line; *c; ++c) if (p.feed((uint8_t)*c, f)) got = true;
-  REQUIRE(got);
-  CHECK(strcmp(f.payload, "24") == 0);
-  CHECK(f.len == 2);
+  REQUIRE(juicebox_build_amps_set(40, buf, sizeof(buf)) > 0);
+  CHECK(strcmp(buf, "~AL002:40:>Oz:") == 0);
 }
 
-TEST_CASE("amps-set clamps an over-limit value to 79") {
+TEST_CASE("amps-set clamps an over-limit value to 79 (with a valid trailer)") {
   char buf[32];
   REQUIRE(juicebox_build_amps_set(100, buf, sizeof(buf)) > 0);
-  char line[40]; snprintf(line, sizeof(line), "%s\r", buf);
-  JuiceBoxParser p; JuiceBoxFrame f; bool got = false;
-  for (char *c = line; *c; ++c) if (p.feed((uint8_t)*c, f)) got = true;
-  REQUIRE(got);
-  CHECK(strcmp(f.payload, "79") == 0);
+  char tr[4]; juicebox_encode_trailer(juicebox_crc("~AL002:79", 9), tr);
+  char want[32]; snprintf(want, sizeof(want), "~AL002:79:%s:", tr);
+  CHECK(strcmp(buf, want) == 0);
+}
+
+TEST_CASE("lock + offline-limit commands are byte-exact vs stock") {
+  char buf[32];
+  REQUIRE(juicebox_build_lock(false, buf, sizeof(buf)) > 0);
+  CHECK(strcmp(buf, "~LK002:00:CiT:") == 0);   // unlock/enable
+  REQUIRE(juicebox_build_lock(true, buf, sizeof(buf)) > 0);
+  CHECK(strncmp(buf, "~LK002:01:", 10) == 0);  // lock/stop (trailer not in capture)
+  CHECK(strlen(buf) == 14);                    // ~LK002:01:XXX:
+  REQUIRE(juicebox_build_offline_limit(40, buf, sizeof(buf)) > 0);
+  CHECK(strcmp(buf, "~OL002:40:AzL:") == 0);
 }
 
 TEST_CASE("canonical state names are stable") {
