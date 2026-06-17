@@ -75,6 +75,22 @@ bool juicebox_parse_es(const char *payload, uint16_t len, JuiceBoxStatus &out);
 // vehicle"; distinguishing Connected needs the H pilot-voltage field (follow-up).
 LiteEvseState juicebox_map_state(int raw);
 
+// Parse the leading numeric fault code from a $WR payload: "005:Pilot Signal Gen
+// Fail:" -> 5, "003:No GND:" -> 3. Returns -1 if it doesn't begin with a digit.
+int juicebox_wr_code(const char *wr);
+
+// Map a JuiceBox $WR fault code onto the closest OpenEVSE state code (4..11) so
+// OpenEVSE-shaped consumers (web UI label table, Home Assistant) show a sensible
+// fault instead of a blanket "stuck relay". JuiceBox $WR taxonomy (RE notes):
+//   001 FW Self Tests Failed   003 No GND              004 Short Circuit Pilot
+//   005 Pilot Signal Gen Fail  006 GFI Auto Test Fail  007 Relay Stuck Closed
+//   008 Ground Fault Int Lockout  101 Ground Fault Int  102 Relay Stuck Open
+// OpenEVSE codes: 5 diode, 6 GFCI fault, 7 no-ground, 8 stuck-relay, 9 GFCI self-test.
+// Pilot faults (004/005) have no OpenEVSE equivalent -> nearest pilot-domain code
+// (5 diode); the EXACT text always rides the `wr` field for the UI to render.
+// Unknown codes -> 8 (generic fault slot). Pure (native-tested).
+int juicebox_fault_openevse_state(int wrCode);
+
 // --- Frame checksum (custom hash @ ATmega flash 0x4998) -------------------------
 // Verified byte-exact against 23 captured stock frames in both directions
 // (2026-06-17 dual-UART tap). The hash covers the whole frame INCLUDING the leading

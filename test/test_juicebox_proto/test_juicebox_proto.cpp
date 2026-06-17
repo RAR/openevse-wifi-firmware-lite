@@ -33,6 +33,28 @@ TEST_CASE("the next $ flushes the previous frame (no terminator needed)") {
   CHECK(strcmp(f.payload, "20") == 0);
 }
 
+TEST_CASE("juicebox_wr_code parses the leading $WR fault number") {
+  CHECK(juicebox_wr_code("005:Pilot Signal Gen Fail:") == 5);
+  CHECK(juicebox_wr_code("003:No GND:") == 3);
+  CHECK(juicebox_wr_code("101:Ground Fault Int:") == 101);
+  CHECK(juicebox_wr_code("No GND") == -1);     // no leading digits
+  CHECK(juicebox_wr_code("") == -1);
+  CHECK(juicebox_wr_code(nullptr) == -1);
+}
+
+TEST_CASE("juicebox_fault_openevse_state maps faults to the closest OpenEVSE code") {
+  CHECK(juicebox_fault_openevse_state(3)   == 7);  // No GND -> no ground
+  CHECK(juicebox_fault_openevse_state(6)   == 9);  // GFI Auto Test Fail -> GFCI self-test
+  CHECK(juicebox_fault_openevse_state(7)   == 8);  // Relay Stuck Closed -> stuck relay
+  CHECK(juicebox_fault_openevse_state(8)   == 6);  // Ground Fault Int Lockout -> GFCI fault
+  CHECK(juicebox_fault_openevse_state(101) == 6);  // Ground Fault Int -> GFCI fault
+  CHECK(juicebox_fault_openevse_state(102) == 8);  // Relay Stuck Open -> stuck relay
+  CHECK(juicebox_fault_openevse_state(5)   == 5);  // Pilot Signal Gen Fail -> diode (nearest, NOT relay)
+  CHECK(juicebox_fault_openevse_state(4)   == 5);  // Short Circuit Pilot -> diode (nearest)
+  CHECK(juicebox_fault_openevse_state(1)   == 9);  // FW Self Tests Failed -> self-test
+  CHECK(juicebox_fault_openevse_state(999) == 8);  // unknown -> generic fault slot
+}
+
 TEST_CASE("garbage before '$' is discarded (resync)") {
   JuiceBoxParser p; JuiceBoxFrame f;
   REQUIRE(feed_str(p, "xyz\x01\x02$FW006:100102\r", f));
