@@ -23,10 +23,17 @@ bool lite_config_save_wifi(const LiteWifiConfig &in);
 bool lite_config_load_evse(LiteEvseConfig &out);  // false if max_current_hard key absent (use defaults)
 bool lite_config_save_evse(const LiteEvseConfig &in);
 
+// First-run setup gate. The web UI shows the onboarding wizard until /config
+// reports wizard_passed:true, which the wizard's finish step POSTs. Persisted so
+// onboarding doesn't reappear after reboot.
+bool lite_config_load_wizard(bool &out);          // false if key absent (caller defaults to false)
+bool lite_config_save_wizard(bool passed);
+
 void lite_config_erase();                         // wipe WiFi creds (eraseConfig)
 
-// Clock config (mirrors upstream keys: sntp_hostname/"sh", time_zone offset).
-struct LiteClockConfig { String sntp_hostname; int tz_offset_min; };
+// Clock config (mirrors upstream keys). time_zone is the UI's "IANA|POSIX-TZ" string
+// (kept for display round-trip); tz_offset_min is the standard UTC offset derived from it.
+struct LiteClockConfig { String sntp_hostname; int tz_offset_min; String time_zone; bool sntp_enabled; };
 
 bool lite_config_load_totals(LiteEnergyTotals &out);   // false if key absent (caller inits)
 bool lite_config_save_totals(const LiteEnergyTotals &in);

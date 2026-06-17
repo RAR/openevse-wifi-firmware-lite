@@ -106,6 +106,19 @@ bool lite_config_save_evse(const LiteEvseConfig &in)
          kv_set_int("max_current_soft", in.max_current_soft);
 }
 
+bool lite_config_load_wizard(bool &out)
+{
+  int v = 0;
+  if (!kv_get_int("wizard_passed", v)) return false;
+  out = (v != 0);
+  return true;
+}
+
+bool lite_config_save_wizard(bool passed)
+{
+  return kv_set_int("wizard_passed", passed ? 1 : 0);
+}
+
 void lite_config_erase()
 {
   if (!s_ready) return;
@@ -190,9 +203,13 @@ bool lite_config_load_clock(LiteClockConfig &out)
 {
   out.sntp_hostname = "pool.ntp.org";   // defaults
   out.tz_offset_min = 0;
+  out.time_zone     = "";
+  out.sntp_enabled  = true;             // NTP on by default
   if (!s_ready) return false;
   kv_get_str("sntp_hostname", out.sntp_hostname);
   kv_get_int("tz_offset_min", out.tz_offset_min);
+  kv_get_str("time_zone", out.time_zone);
+  int en = 1; if (kv_get_int("sntp_enabled", en)) out.sntp_enabled = (en != 0);
   return true;
 }
 
@@ -201,6 +218,8 @@ bool lite_config_save_clock(const LiteClockConfig &in)
   if (!s_ready) return false;
   bool ok = kv_set_str("sntp_hostname", in.sntp_hostname);
   ok = kv_set_int("tz_offset_min", in.tz_offset_min) && ok;
+  ok = kv_set_str("time_zone", in.time_zone) && ok;
+  ok = kv_set_int("sntp_enabled", in.sntp_enabled ? 1 : 0) && ok;
   return ok;
 }
 

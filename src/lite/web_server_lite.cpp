@@ -67,6 +67,8 @@ bool web_server_lite_in_ap_mode(void)     { return s_apMode; }
 static LiteClock        *s_clock  = nullptr;
 static LiteEnergyTotals *s_totals = nullptr;
 static String            s_sntpHost = "pool.ntp.org";
+static bool              s_sntpEnabled = true;   // /config sntp_enabled (NTP on/off)
+static String            s_timeZone    = "";     // /config time_zone ("IANA|POSIX") for UI round-trip
 
 static LiteDivertState s_divertState = { 0.0 };
 static uint32_t        s_divertLastMs = 0;          // for smoothing delta_s
@@ -75,6 +77,10 @@ static bool            s_divertWasCharging = false;
 static const uint32_t  FEED_STALE_MS = 120000;      // feed staleness window (fail-safe pause)
 
 static LiteShaperState s_shaperState = { 0.0, false };
+// Runtime divert/shaper results cached for /status (the Solar/Shaper pages read them live).
+static int    s_divertChargeRate = 0;    // last divert-commanded charge current (A)
+static double s_shaperCur        = 0.0;  // last shaper current cap (A)
+static bool   s_shaperUpdated    = false;// shaper produced a fresh cap this cycle
 static uint32_t        s_shaperLastMs   = 0;  // smoothing delta_s
 static uint32_t        s_shaperPauseMs  = 0;  // millis when current pause began (0 = not paused)
 static const double    LITE_SHAPER_HYSTERESIS = 0.5; // A
@@ -83,6 +89,7 @@ static const int       LITE_MIN_CURRENT = 6;         // J1772 floor
 // Active EVSE config cached in RAM so /status and GET /config never touch flash.
 // Seeded at web_server_lite_begin() from the store (or defaults) and updated on POST.
 static LiteEvseConfig s_cfg = { 32, 32 }; // {soft, hard} defaults (smallest JuiceBox sold)
+static bool s_wizardPassed = false;       // first-run setup gate the web UI watches (config.wizard_passed)
 
 // Solar-divert config cached in RAM. Seeded at begin() from the store (or upstream defaults).
 static LiteDivertConfig s_divertCfg = { false, 0, 1.1, 20, 600, 600 }; // upstream defaults
@@ -320,8 +327,10 @@ void web_server_lite_build_status(JsonDocument &doc)
     bool disabled       = (s_mgr_ctrl->getState() == EvseState::Disabled);
 
     // State (int + string), per the OpenEVSE contract.
-    doc["state"]  = openevse_state_code(dev, disabled);
-    doc["status"] = openevse_status_str(dev, disabled);
+    int state_code = openevse_state_code(dev, disabled);
+    doc["state"]   = state_code;
+    doc["status"]  = openevse_status_str(dev, disabled);
+    doc["vehicle"] = (state_code == 2 || state_code == 3) ? 1 : 0;  // plugged in (connected/charging)
 
     // Live telemetry.
     int amp   = s_mgr_ctrl->getAmps();
@@ -336,7 +345,6 @@ void web_server_lite_build_status(JsonDocument &doc)
     doc["min_current_hard"]  = s_mgr_ctrl->getMinCurrent();
     doc["available_current"] = (uint32_t)s_mgr_ctrl->getMaxCurrent();
     doc["manual_override"]   = manual.isActive() ? 1 : 0;
-    doc["mode"]              = "fast";
 
     // Derived voltage: power / amps while charging, else nominal 240 V. Keeps
     // HA's V x I ~= power consistent without a sensor the JuiceBox lacks.
@@ -351,6 +359,23 @@ void web_server_lite_build_status(JsonDocument &doc)
     // Backend-specific extras (hw/fw/protocol/md/wc/wr/line + state_str). The
     // `wr` key carries the raw $WR fault string (the fault detail for state 8).
     s_mgr_ctrl->addStatusFields(doc);
+    bool evse_online = doc["comms_online"].as<bool>();
+    doc["evse_connected"] = evse_online ? 1 : 0;   // UI "EVSE not connected" banner keys off this
+    doc["rapi_connected"] = evse_online ? 1 : 0;
+
+    // Telemetry under the canonical names the web UI reads.
+    doc["temp"]            = s_mgr_ctrl->getTemperature();          // dashboard temp chip reads .temp
+    doc["session_elapsed"] = (uint32_t)s_mgr_ctrl->getSessionElapsed();
+    doc["max_current"]     = s_mgr_ctrl->getMaxHardwareCurrent();
+    doc["service_level"]   = 1;
+
+    // Eco/divert + load-shaper runtime (the Solar/Shaper settings pages show these live).
+    doc["divertmode"]     = s_divertCfg.enabled ? 2 : 1;   // 2=Eco(divert) selected, 1=normal
+    doc["divert_active"]  = (s_mgr_ctrl->getState(EvseClient_OpenEVSE_Divert) == EvseState::Active) ? 1 : 0;
+    doc["charge_rate"]    = s_divertChargeRate;
+    doc["shaper"]         = s_shaperCfg.enabled ? 1 : 0;
+    doc["shaper_cur"]     = s_shaperCur;
+    doc["shaper_updated"] = s_shaperUpdated;
 
     // Control/claim diagnostics (retained from the prior status body).
     doc["claims"] = (uint32_t)s_mgr_ctrl->activeClaimCount();
@@ -367,16 +392,56 @@ void web_server_lite_build_status(JsonDocument &doc)
     doc["ipaddress"] = ipbuf; }
   doc["ssid"]      = WiFi.SSID();
   doc["srssi"]     = WiFi.RSSI();
+  doc["mode"]                  = s_apMode ? "AP" : "STA";  // NETWORK mode (UI Network card), not charge mode
+  doc["wifi_client_connected"] = (WiFi.status() == WL_CONNECTED) ? 1 : 0;  // UI "Connection" row
+  doc["eth_connected"]         = 0;                        // no wired NIC on the WGM160P
+  doc["net_connected"]         = (WiFi.status() == WL_CONNECTED) ? 1 : 0;
+  doc["macaddress"]            = WiFi.macAddress();
   doc["free_heap"] = ESPAL.getFreeHeap();
   doc["freeram"]   = ESPAL.getFreeHeap();
   doc["uptime"]    = (uint32_t)(millis() / 1000);
   doc["reboot_reason"] = ESPAL.getRebootReason();   // RMU cause of the last reset (latched at boot)
   doc["schedule_version"] = s_scheduleVersion;
+  // Store-version counters the UI watches to refresh on change. lite only tracks schedule;
+  // the rest are 0 (the UI fetches them once at startup and trusts optimistic local updates
+  // on its own writes), present so the UI reads defined values rather than undefined.
+  doc["config_version"]        = 0;
+  doc["claims_version"]        = 0;
+  doc["override_version"]      = 0;
+  doc["schedule_plan_version"] = 0;
+  doc["limit_version"]         = 0;
+  // Subsystem connection states. mqtt is real on lite; the rest are subsystems a JuiceBox
+  // lacks -> honest "not connected" defaults so the UI shows status instead of blanks.
+  doc["mqtt_connected"]    = s_mqtt.connected() ? 1 : 0;
+  doc["emoncms_connected"] = 0;
+  doc["ocpp_connected"]    = 0;
+  doc["rfid_failure"]      = 0;
+  doc["ohm_hour"]          = "NotConnected";
+  doc["packets_sent"]      = 0;
+  doc["packets_success"]   = 0;
+  // Fault/diagnostic counters + flags the JuiceBox host doesn't surface.
+  doc["gfcicount"]  = 0;
+  doc["nogndcount"] = 0;
+  doc["stuckcount"] = 0;
+  doc["flags"]      = 0;
+  doc["colour"]     = 0;
+  doc["ota_update"] = 0;
+  doc["limit"]      = false;
 
   if (s_clock && s_clock->valid()) {
     char isobuf[24];
     lite_clock_iso8601(s_clock->nowUtc(millis()), isobuf, sizeof(isobuf));
     doc["time"] = isobuf;                        // ISO-8601 UTC; omitted until first sync
+    // local_time (offset-suffixed) + offset string, for the UI clock display.
+    char localbuf[24];
+    lite_clock_iso8601(s_clock->nowLocal(millis()), localbuf, sizeof(localbuf));
+    size_t ll = strlen(localbuf);
+    if (ll && localbuf[ll - 1] == 'Z') localbuf[ll - 1] = '\0';   // strip the UTC 'Z'
+    int off = s_clock->tzOffsetMinutes();
+    char offbuf[8];
+    snprintf(offbuf, sizeof(offbuf), "%c%02d%02d", off < 0 ? '-' : '+', abs(off) / 60, abs(off) % 60);
+    doc["local_time"] = String(localbuf) + offbuf;
+    doc["offset"]     = offbuf;
   }
   if (s_totals) {
     doc["total_energy"]   = s_totals->lifetime_wh / 1000.0;  // kWh
@@ -396,10 +461,31 @@ void web_server_lite_build_status(JsonDocument &doc)
 
 static void build_status_json(String &out)
 {
-  StaticJsonDocument<1792> doc;   // bumped from 1280: field set grew (reboot_reason + rx-health);
-                                  // 1280 was overflowing and silently dropping trailing fields
+  StaticJsonDocument<3072> doc;   // bumped 1280->1792->3072 as the field set grew (canonical
+                                  // /status alignment); undersizing silently drops trailing fields
   web_server_lite_build_status(doc);
   serializeJson(doc, out);
+}
+
+// Parse the STANDARD UTC offset (minutes east of UTC) from a POSIX TZ string —
+// e.g. "EST5EDT,M3.2.0,M11.1.0" -> -300, "CET-1CEST,..." -> +60,
+// "<+0530>-5:30" -> +330, "GMT0" -> 0. The numeric field is hours WEST of UTC, so
+// the east-of-UTC value lite's clock wants is its negation. DST transition rules
+// (the ,Mm.w.d parts) are ignored — lite applies the standard offset only.
+static int posix_tz_offset_min(const char *tz)
+{
+  if (!tz || !*tz) return 0;
+  const char *p = tz;
+  if (*p == '<') { while (*p && *p != '>') p++; if (*p == '>') p++; }   // <+0530> style
+  else { while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) p++; }
+  int sign = 1;
+  if      (*p == '+') p++;
+  else if (*p == '-') { sign = -1; p++; }
+  if (!(*p >= '0' && *p <= '9')) return 0;                 // e.g. "GMT0" parsed name only -> 0
+  int hh = 0; while (*p >= '0' && *p <= '9') { hh = hh * 10 + (*p - '0'); p++; }
+  int mm = 0;
+  if (*p == ':') { p++; while (*p >= '0' && *p <= '9') { mm = mm * 10 + (*p - '0'); p++; } }
+  return -(sign * (hh * 60 + mm));   // negate WEST-of-UTC -> east-of-UTC
 }
 
 // Serialize the cached config as the canonical /config response body.
@@ -426,62 +512,137 @@ static void config_json(String &out)
   doc["mqtt_user"]    = s_mqttCfg.user;
   doc["mqtt_period"]  = s_mqttCfg.period_s;
   // mqtt_pass intentionally NOT echoed; a present non-empty mqtt_pass on POST replaces it.
+  doc["wizard_passed"] = s_wizardPassed;   // first-run gate; App.svelte shows the wizard until true
+  // Firmware versions for the UI's About/Firmware pages, which read them from
+  // /config (not /status): "version" = WiFi gateway (this lite fw), "firmware" =
+  // EVSE controller. lite has no validated controller-fw read, so both report
+  // LITE_FW_VERSION (matches /status). GUI version is the UI's build-time const.
+  doc["firmware"] = LITE_FW_VERSION;
+  doc["version"]  = LITE_FW_VERSION;
+  doc["ssid"]     = WiFi.SSID();   // UI Network card SSID row reads config.ssid
+  // Time settings (UI Time page reads these from /config).
+  doc["time_zone"]     = s_timeZone;
+  doc["sntp_enabled"]  = s_sntpEnabled;
+  doc["sntp_hostname"] = s_sntpHost;
   serializeJson(doc, out);
 }
 
-// Query arg present and non-empty (mirrors the old mg_get_http_var "> 0" gate).
-static bool qarg(const char *k, String &v) { v = s_server.arg(k); return v.length() > 0; }
+// Read a config param from a POST: the web UI sends a JSON object of changed
+// keys (Content-Type application/json); legacy/curl callers may send form args.
+// `json` selects the source; value (numbers/bools stringified) returns in v so
+// the per-field toInt()/toFloat() apply logic below is shared by both paths.
+static bool cfg_get(JsonDocument &doc, bool json, const char *k, String &v) {
+  if (json) {
+    if (!doc.containsKey(k)) return false;
+    JsonVariantConst jv = doc[k];
+    if      (jv.is<bool>())         v = jv.as<bool>() ? "1" : "0";   // downstream does toInt()!=0
+    else if (jv.is<const char *>()) v = jv.as<const char *>();
+    else if (jv.is<float>())        v = String(jv.as<double>(), 6);  // covers JSON ints + floats in v6
+    else                            v = jv.as<String>();
+    return true;
+  }
+  v = s_server.arg(k);
+  return v.length() > 0;
+}
 
 static void handle_config()
 {
-  String v;
-  bool any = false;
-  LiteEvseConfig cfg = s_cfg;
-  if (qarg("max_current_hard", v)) { cfg.max_current_hard = v.toInt(); any = true; }
-  if (qarg("max_current_soft", v)) { cfg.max_current_soft = v.toInt(); any = true; }
+  // GET -> the full config object.
+  if (s_server.method() == HTTP_GET) {
+    String body; config_json(body);
+    s_server.send(200, "application/json", body);
+    return;
+  }
 
-  if (qarg("tz_offset_min", v)) {
+  // POST: parse the raw body (arg "plain") as JSON; fall back to form args when
+  // it isn't valid JSON. The web UI's config_store.upload() POSTs JSON and keys
+  // success off a {"msg":"done"|"no change"} reply.
+  StaticJsonDocument<1024> doc;
+  bool json = false;
+  {
+    String plain = s_server.arg("plain");
+    if (plain.length() && deserializeJson(doc, plain) == DeserializationError::Ok && doc.is<JsonObject>())
+      json = true;
+  }
+
+  String v;
+  bool changed = false;   // anything applied -> {"msg":"done"} (else "no change")
+  int  status  = 200;
+
+  LiteEvseConfig cfg = s_cfg; bool any = false;
+  if (cfg_get(doc, json, "max_current_hard", v)) { cfg.max_current_hard = v.toInt(); any = true; }
+  if (cfg_get(doc, json, "max_current_soft", v)) { cfg.max_current_soft = v.toInt(); any = true; }
+
+  if (cfg_get(doc, json, "tz_offset_min", v)) {
     LiteClockConfig cc; lite_config_load_clock(cc);
     cc.tz_offset_min = v.toInt(); lite_config_save_clock(cc);
     if (s_clock) s_clock->setTzOffsetMinutes(cc.tz_offset_min);
+    changed = true;
   }
-  if (qarg("sntp_hostname", v)) {
+  if (cfg_get(doc, json, "sntp_hostname", v)) {
     LiteClockConfig cc; lite_config_load_clock(cc);
     cc.sntp_hostname = v.c_str(); lite_config_save_clock(cc);
     s_sntpHost = v.c_str();
     sntp_setservername(0, s_sntpHost.c_str());
+    changed = true;
+  }
+  if (cfg_get(doc, json, "time_zone", v)) {
+    // The UI value is "IANA|POSIX-TZ"; derive the standard offset from the POSIX part.
+    int bar = v.indexOf('|');
+    String posix = (bar >= 0) ? v.substring(bar + 1) : v;
+    int off = posix_tz_offset_min(posix.c_str());
+    LiteClockConfig cc; lite_config_load_clock(cc);
+    cc.time_zone = v.c_str(); cc.tz_offset_min = off; lite_config_save_clock(cc);
+    s_timeZone = v.c_str();
+    if (s_clock) s_clock->setTzOffsetMinutes(off);
+    changed = true;
+  }
+  if (cfg_get(doc, json, "sntp_enabled", v)) {
+    bool en = v.toInt() != 0;
+    LiteClockConfig cc; lite_config_load_clock(cc);
+    cc.sntp_enabled = en; lite_config_save_clock(cc);
+    s_sntpEnabled = en;
+    if (en) { sntp_setservername(0, s_sntpHost.c_str()); sntp_init(); }
+    else    { sntp_stop(); }   // manual mode: stop NTP so it can't override a set clock
+    changed = true;
   }
 
   LiteDivertConfig dcfg = s_divertCfg; bool dany = false;
-  if (qarg("divert_enabled", v)) { dcfg.enabled = v.toInt() != 0; dany = true; }
-  if (qarg("divert_type", v))    { dcfg.type = v.toInt() ? 1 : 0; dany = true; }
-  if (qarg("divert_PV_ratio", v))              { dcfg.pv_ratio = v.toFloat(); dany = true; }
-  if (qarg("divert_attack_smoothing_time", v)) { dcfg.attack_s = (uint32_t)v.toInt(); dany = true; }
-  if (qarg("divert_decay_smoothing_time", v))  { dcfg.decay_s = (uint32_t)v.toInt(); dany = true; }
-  if (qarg("divert_min_charge_time", v))       { dcfg.min_charge_s = (uint32_t)v.toInt(); dany = true; }
-  if (dany) { lite_config_save_divert(dcfg); s_divertCfg = dcfg; }
+  if (cfg_get(doc, json, "divert_enabled", v)) { dcfg.enabled = v.toInt() != 0; dany = true; }
+  if (cfg_get(doc, json, "divert_type", v))    { dcfg.type = v.toInt() ? 1 : 0; dany = true; }
+  if (cfg_get(doc, json, "divert_PV_ratio", v))              { dcfg.pv_ratio = v.toFloat(); dany = true; }
+  if (cfg_get(doc, json, "divert_attack_smoothing_time", v)) { dcfg.attack_s = (uint32_t)v.toInt(); dany = true; }
+  if (cfg_get(doc, json, "divert_decay_smoothing_time", v))  { dcfg.decay_s = (uint32_t)v.toInt(); dany = true; }
+  if (cfg_get(doc, json, "divert_min_charge_time", v))       { dcfg.min_charge_s = (uint32_t)v.toInt(); dany = true; }
+  if (dany) { lite_config_save_divert(dcfg); s_divertCfg = dcfg; changed = true; }
 
   LiteShaperConfig scfg = s_shaperCfg; bool sany = false;
-  if (qarg("current_shaper_enabled", v)) { scfg.enabled = v.toInt() != 0; sany = true; }
-  if (qarg("current_shaper_max_pwr", v))          { scfg.max_pwr_w = (uint32_t)v.toInt(); sany = true; }
-  if (qarg("current_shaper_smoothing_time", v))   { scfg.smoothing_s = (uint32_t)v.toInt(); sany = true; }
-  if (qarg("current_shaper_data_maxinterval", v)) { scfg.data_maxinterval_s = (uint32_t)v.toInt(); sany = true; }
-  if (qarg("current_shaper_min_pause_time", v))   { scfg.min_pause_s = (uint32_t)v.toInt(); sany = true; }
-  if (sany) { lite_config_save_shaper(scfg); s_shaperCfg = scfg; }
+  if (cfg_get(doc, json, "current_shaper_enabled", v)) { scfg.enabled = v.toInt() != 0; sany = true; }
+  if (cfg_get(doc, json, "current_shaper_max_pwr", v))          { scfg.max_pwr_w = (uint32_t)v.toInt(); sany = true; }
+  if (cfg_get(doc, json, "current_shaper_smoothing_time", v))   { scfg.smoothing_s = (uint32_t)v.toInt(); sany = true; }
+  if (cfg_get(doc, json, "current_shaper_data_maxinterval", v)) { scfg.data_maxinterval_s = (uint32_t)v.toInt(); sany = true; }
+  if (cfg_get(doc, json, "current_shaper_min_pause_time", v))   { scfg.min_pause_s = (uint32_t)v.toInt(); sany = true; }
+  if (sany) { lite_config_save_shaper(scfg); s_shaperCfg = scfg; changed = true; }
 
   LiteMqttConfig mcfg = s_mqttCfg; bool many = false;
-  if (qarg("mqtt_enabled", v)) { mcfg.enabled = v.toInt() != 0; many = true; }
-  if (qarg("mqtt_server", v))  { mcfg.server  = v;              many = true; }
-  if (qarg("mqtt_port", v))    { int p = v.toInt(); mcfg.port = (p >= 1 && p <= 65535) ? p : 1883; many = true; }
-  if (qarg("mqtt_topic", v))   { mcfg.topic   = v;              many = true; }
-  if (qarg("mqtt_user", v))    { mcfg.user    = v;              many = true; }
-  if (qarg("mqtt_period", v))  { mcfg.period_s = (uint32_t)v.toInt(); many = true; }
-  // Password: only overwrite when a non-empty value is supplied (qarg requires
-  // length > 0), so re-saving the form with a blank pass preserves the stored one.
-  if (qarg("mqtt_pass", v))    { mcfg.pass    = v;              many = true; }
-  if (many) { lite_config_save_mqtt(mcfg); s_mqttCfg = mcfg; s_mqtt.reconfigure(mcfg); }
+  if (cfg_get(doc, json, "mqtt_enabled", v)) { mcfg.enabled = v.toInt() != 0; many = true; }
+  if (cfg_get(doc, json, "mqtt_server", v))  { mcfg.server  = v;              many = true; }
+  if (cfg_get(doc, json, "mqtt_port", v))    { int p = v.toInt(); mcfg.port = (p >= 1 && p <= 65535) ? p : 1883; many = true; }
+  if (cfg_get(doc, json, "mqtt_topic", v))   { mcfg.topic   = v;              many = true; }
+  if (cfg_get(doc, json, "mqtt_user", v))    { mcfg.user    = v;              many = true; }
+  if (cfg_get(doc, json, "mqtt_period", v))  { mcfg.period_s = (uint32_t)v.toInt(); many = true; }
+  // Password: only overwrite when a non-empty value is supplied (cfg_get requires
+  // length > 0 on the form path), so re-saving with a blank pass keeps the stored one.
+  if (cfg_get(doc, json, "mqtt_pass", v) && v.length()) { mcfg.pass = v;       many = true; }
+  if (many) { lite_config_save_mqtt(mcfg); s_mqttCfg = mcfg; s_mqtt.reconfigure(mcfg); changed = true; }
 
-  int status = 200;
+  // First-run setup gate: the web UI's wizard finish POSTs wizard_passed:true.
+  if (cfg_get(doc, json, "wizard_passed", v)) {
+    bool wp = v.toInt() != 0;
+    if (wp != s_wizardPassed) { s_wizardPassed = wp; lite_config_save_wizard(wp); }
+    changed = true;
+  }
+
   if (any) {
     cfg.max_current_hard = lite_clamp_service_max(cfg.max_current_hard);
     cfg.max_current_soft = lite_clamp_charge_current(cfg.max_current_soft, cfg.max_current_hard);
@@ -492,10 +653,13 @@ static void handle_config()
       s_mgr_ctrl->setTargetChargeCurrent((uint32_t)cfg.max_current_soft);
     }
     if (!saved) status = 503;   // applied but not persisted
+    changed = true;
   }
 
-  String body; config_json(body);
-  s_server.send(status, "application/json", body);
+  StaticJsonDocument<48> r;
+  r["msg"] = changed ? "done" : "no change";
+  String resp; serializeJson(r, resp);
+  s_server.send(status, "application/json", resp);
 }
 
 static void handle_status() {
@@ -605,19 +769,42 @@ static void handle_update_done() {
   }
 }
 
-// GET / -> gzip bundle for the current mode. Binary-safe: sendContent writes raw
-// bytes (gzip has NULs). Sockets stream it (bounded by TCP_SND_BUF) — no big mbuf.
-static void handle_root() {
-  const uint8_t *body = s_apMode ? SETUP_HTML_GZ : INDEX_HTML_GZ;
-  unsigned len        = s_apMode ? SETUP_HTML_GZ_LEN : INDEX_HTML_GZ_LEN;
-  s_server.sendHeader("Content-Encoding", "gzip");
-  s_server.setContentLength(len);
-  s_server.send(200, "text/html", "");
-  s_server.sendContent((const char *)body, (size_t)len);
+// Look up an embedded UI asset by request path (exact match).
+static const LiteStaticFile *find_static(const String &path) {
+  for (unsigned i = 0; i < LITE_STATIC_FILE_COUNT; i++) {
+    if (path == LITE_STATIC_FILES[i].path) return &LITE_STATIC_FILES[i];
+  }
+  return nullptr;
 }
 
+// Serve one embedded asset. Binary-safe: sendContent writes raw bytes (gzip and
+// PNGs contain NULs). Sockets stream it (bounded by TCP_SND_BUF) — no big mbuf.
+static void serve_static(const LiteStaticFile *f) {
+  if (f->gzip) s_server.sendHeader("Content-Encoding", "gzip");
+  s_server.sendHeader("Cache-Control", "public, max-age=86400");
+  s_server.setContentLength(f->len);
+  s_server.send(200, f->content_type, "");
+  s_server.sendContent((const char *)f->data, (size_t)f->len);
+}
+
+// GET / -> the unified web UI's index.html (the app self-provisions in AP mode
+// via /scan + /connect, so the same bundle serves STA and AP).
+static void handle_root() {
+  const LiteStaticFile *f = find_static("/index.html");
+  if (f) serve_static(f); else s_server.send(500, "text/plain", "no ui");
+}
+
+// Catch-all: serve any embedded asset by path; otherwise a 404. The web UI uses
+// HASH routing (#/...), so client routes never hit the server and need no SPA
+// fallback. The 404 BODY is JSON, not plain text: the UI's fetch layer
+// (httpAPI.js) calls response.json() without checking response.ok, so a
+// non-JSON 404 body throws a SyntaxError; {"msg":"error"} parses cleanly and is
+// exactly the "endpoint absent / failed" sentinel every store checks for, so
+// capability/history probes (e.g. /logs, /limit, /claims/target) degrade right.
 static void handle_not_found() {
-  s_server.send(404, "text/plain", "not found");
+  const LiteStaticFile *f = find_static(s_server.uri());
+  if (f) { serve_static(f); return; }
+  s_server.send(404, "application/json", "{\"msg\":\"error\"}");
 }
 
 void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTotals &totals)
@@ -628,7 +815,9 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
 
   LiteClockConfig cc;
   lite_config_load_clock(cc);
-  s_sntpHost = cc.sntp_hostname;
+  s_sntpHost    = cc.sntp_hostname;
+  s_sntpEnabled = cc.sntp_enabled;
+  s_timeZone    = cc.time_zone;
   clock.setTzOffsetMinutes(cc.tz_offset_min);
 
   if (!lite_config_load_schedule(s_schedule)) {
@@ -646,6 +835,7 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
 
   lite_config_load_divert(s_divertCfg);   // keeps defaults if the key is absent
   lite_config_load_shaper(s_shaperCfg);  // keeps defaults if the key is absent
+  lite_config_load_wizard(s_wizardPassed); // keeps default false if never set (shows wizard)
 
   lite_config_load_mqtt(s_mqttCfg);       // fills defaults if absent (disabled by default)
   s_mqtt.begin(s_mqttCfg, ESPAL.getShortId(), LITE_FW_VERSION);
@@ -663,7 +853,7 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
   s_server.begin();
   sntp_setoperatingmode(SNTP_OPMODE_POLL);
   sntp_setservername(0, s_sntpHost.c_str());   // s_sntpHost is a stable static String
-  sntp_init();
+  if (s_sntpEnabled) sntp_init();              // skipped in manual time mode
 }
 
 void web_server_lite_loop()
@@ -741,6 +931,7 @@ void web_server_lite_loop()
       // Stale feed -> pause charge (Disabled@Limit), arm pause timer, freeze smoothing.
       if (!s_shaperPauseMs) s_shaperPauseMs = now;
       s_shaperState.paused = true;
+      s_shaperUpdated = false;
       if (s_mgr_ctrl->getState(EvseClient_OpenEVSE_Shaper) != EvseState::Disabled) {
         EvseProperties p(EvseState::Disabled);
         s_mgr_ctrl->claim(EvseClient_OpenEVSE_Shaper, EvseManager_Priority_Limit, p);
@@ -751,6 +942,7 @@ void web_server_lite_loop()
                                    s_shaperState, s_feed.shaper_w, volts, present_a,
                                    s_feed.solar_w, s_divertCfg.enabled && s_divertCfg.type == 0,
                                    delta_s);
+      s_shaperCur = cap; s_shaperUpdated = true;   // cache for /status
       EvseProperties p;
       p.setMaxCurrent((uint32_t)(cap < 0 ? 0 : (uint32_t)cap));
       if (cap < LITE_MIN_CURRENT) {
@@ -768,6 +960,7 @@ void web_server_lite_loop()
   } else if (s_mgr_ctrl && s_mgr_ctrl->clientHasClaim(EvseClient_OpenEVSE_Shaper)) {
     s_mgr_ctrl->release(EvseClient_OpenEVSE_Shaper);
     s_shaperState.smoothed_live_pwr = 0; s_shaperPauseMs = 0; s_shaperState.paused = false;
+    s_shaperCur = 0; s_shaperUpdated = false;
   }
 
   // Solar-divert (autonomous, OpenEVSE-priority). Claims Active@Divert(50) when excess
@@ -799,6 +992,7 @@ void web_server_lite_loop()
                        s_divertCfg.attack_s, s_divertCfg.decay_s, 6 };
     LiteDivertResult r = lite_divert_eval(dc, s_divertState, solar_w, grid_w, volts,
                                           present_a, active, min_elapsed, delta_s);
+    s_divertChargeRate = r.charge_rate_a;   // cache for /status charge_rate
 
     if (r.action == LiteDivertAction::Charge) {
       EvseProperties p(EvseState::Active);
@@ -818,6 +1012,7 @@ void web_server_lite_loop()
   } else if (s_mgr_ctrl && s_mgr_ctrl->clientHasClaim(EvseClient_OpenEVSE_Divert)) {
     s_mgr_ctrl->release(EvseClient_OpenEVSE_Divert);   // divert turned off -> drop the claim
     s_divertState.smoothed_available = 0;
+    s_divertChargeRate = 0;
   }
 
   // MQTT telemetry: per-field publish on cadence (faster while charging). No-op when
