@@ -467,25 +467,123 @@ static void build_status_json(String &out)
   serializeJson(doc, out);
 }
 
-// Parse the STANDARD UTC offset (minutes east of UTC) from a POSIX TZ string —
-// e.g. "EST5EDT,M3.2.0,M11.1.0" -> -300, "CET-1CEST,..." -> +60,
-// "<+0530>-5:30" -> +330, "GMT0" -> 0. The numeric field is hours WEST of UTC, so
-// the east-of-UTC value lite's clock wants is its negation. DST transition rules
-// (the ,Mm.w.d parts) are ignored — lite applies the standard offset only.
-static int posix_tz_offset_min(const char *tz)
-{
+// --- POSIX TZ parsing (the UI's time_zone is an "IANA|POSIX-TZ" string) ----------
+// e.g. "EST5EDT,M3.2.0,M11.1.0", "CET-1CEST,M3.5.0,M10.5.0/3", "<+0530>-5:30".
+
+// Days since 1970-01-01 for civil Y/M/D (Howard Hinnant's algorithm).
+static long tz_days_from_civil(int y, int m, int d) {
+  y -= m <= 2;
+  long era = (y >= 0 ? y : y - 399) / 400;
+  int  yoe = (int)(y - era * 400);
+  int  doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int  doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097L + doe - 719468;
+}
+
+// Civil year that contains a given day count.
+static int tz_year_from_days(long z) {
+  z += 719468;
+  long era = (z >= 0 ? z : z - 146096) / 146097;
+  int  doe = (int)(z - era * 146097);
+  int  yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int  y   = yoe + (int)(era * 400);
+  int  doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  int  mp  = (5 * doy + 2) / 153;
+  int  m   = mp + (mp < 10 ? 3 : -9);
+  return y + (m <= 2);
+}
+
+// Parse a transition rule "Mm.w.d[/h[:mm[:ss]]]" at *p (advances p). Only the M form
+// is supported — it covers every zone in the UI's zones.json. time_s defaults to 02:00.
+static bool tz_parse_rule(const char *&p, int &mon, int &wk, int &dow, int &time_s) {
+  time_s = 2 * 3600;
+  if (*p != 'M') return false;
+  p++;
+  mon = 0; while (*p >= '0' && *p <= '9') { mon = mon * 10 + (*p - '0'); p++; }
+  if (*p != '.') return false; p++;
+  wk  = 0; while (*p >= '0' && *p <= '9') { wk  = wk  * 10 + (*p - '0'); p++; }
+  if (*p != '.') return false; p++;
+  dow = 0; while (*p >= '0' && *p <= '9') { dow = dow * 10 + (*p - '0'); p++; }
+  if (*p == '/') {
+    p++; int hh = 0; while (*p >= '0' && *p <= '9') { hh = hh * 10 + (*p - '0'); p++; }
+    int mm = 0; if (*p == ':') { p++; while (*p >= '0' && *p <= '9') { mm = mm * 10 + (*p - '0'); p++; }
+                                 if (*p == ':') { p++; while (*p >= '0' && *p <= '9') p++; } }
+    time_s = hh * 3600 + mm * 60;
+  }
+  return true;
+}
+
+// Civil-time seconds (local wall clock, treated as if UTC) of an "Mm.w.d" rule in year Y.
+static long tz_rule_civil_secs(int Y, int mon, int wk, int dow, int time_s) {
+  long first = tz_days_from_civil(Y, mon, 1);
+  int  first_dow = (int)(((first % 7) + 4 + 7) % 7);   // 1970-01-01 = Thu(4); 0 = Sunday
+  int  day = 1 + ((dow - first_dow + 7) % 7) + (wk - 1) * 7;
+  static const int mdays[] = { 31,28,31,30,31,30,31,31,30,31,30,31 };
+  int dim = mdays[mon - 1];
+  if (mon == 2 && ((Y % 4 == 0 && Y % 100 != 0) || Y % 400 == 0)) dim = 29;
+  if (day > dim) day -= 7;                              // wk == 5 -> last occurrence
+  return tz_days_from_civil(Y, mon, day) * 86400L + time_s;
+}
+
+// Skip a TZ designation (<...> or letters) then a [+-]hh[:mm[:ss]] offset at *p.
+static void tz_skip_name_offset(const char *&p) {
+  if (*p == '<') { while (*p && *p != '>') p++; if (*p) p++; }
+  else { while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) p++; }
+  if (*p == '+' || *p == '-') p++;
+  while (*p >= '0' && *p <= '9') p++;
+  if (*p == ':') { p++; while (*p >= '0' && *p <= '9') p++;
+                   if (*p == ':') { p++; while (*p >= '0' && *p <= '9') p++; } }
+}
+
+// Standard UTC offset (minutes EAST of UTC) from a POSIX TZ. The numeric field is hours
+// WEST of UTC, so we negate it: "EST5..." -> -300, "CET-1..." -> +60, "GMT0" -> 0.
+static int posix_tz_offset_min(const char *tz) {
   if (!tz || !*tz) return 0;
   const char *p = tz;
-  if (*p == '<') { while (*p && *p != '>') p++; if (*p == '>') p++; }   // <+0530> style
+  if (*p == '<') { while (*p && *p != '>') p++; if (*p == '>') p++; }
   else { while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) p++; }
   int sign = 1;
   if      (*p == '+') p++;
   else if (*p == '-') { sign = -1; p++; }
-  if (!(*p >= '0' && *p <= '9')) return 0;                 // e.g. "GMT0" parsed name only -> 0
+  if (!(*p >= '0' && *p <= '9')) return 0;
   int hh = 0; while (*p >= '0' && *p <= '9') { hh = hh * 10 + (*p - '0'); p++; }
   int mm = 0;
   if (*p == ':') { p++; while (*p >= '0' && *p <= '9') { mm = mm * 10 + (*p - '0'); p++; } }
-  return -(sign * (hh * 60 + mm));   // negate WEST-of-UTC -> east-of-UTC
+  return -(sign * (hh * 60 + mm));
+}
+
+// Effective UTC offset (minutes east) for `utc`, honoring the POSIX DST rules when present.
+// Falls back to the standard offset when there's no DST clause or an unsupported rule form.
+static int lite_tz_offset_min(const char *tz, uint32_t utc) {
+  int std_off = posix_tz_offset_min(tz);
+  if (!tz || !*tz) return std_off;
+  const char *p = tz;
+  tz_skip_name_offset(p);                  // past the std name + offset
+  if (!*p || *p == ',') return std_off;    // no DST designation -> no DST
+  if (*p == '<') { while (*p && *p != '>') p++; if (*p) p++; }   // DST name
+  else { while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) p++; }
+  int dst_off = std_off + 60;              // POSIX default: 1h ahead of std
+  if (*p == '+' || *p == '-' || (*p >= '0' && *p <= '9')) {
+    int sign = 1; if (*p == '+') p++; else if (*p == '-') { sign = -1; p++; }
+    int hh = 0; while (*p >= '0' && *p <= '9') { hh = hh * 10 + (*p - '0'); p++; }
+    int mm = 0; if (*p == ':') { p++; while (*p >= '0' && *p <= '9') { mm = mm * 10 + (*p - '0'); p++; }
+                                 if (*p == ':') { p++; while (*p >= '0' && *p <= '9') p++; } }
+    dst_off = -(sign * (hh * 60 + mm));
+  }
+  if (*p != ',') return std_off;           // DST name but no rules -> can't place the window
+  p++;
+  int sm, sw, sdow, sts, em, ew, edow, ets;
+  if (!tz_parse_rule(p, sm, sw, sdow, sts)) return std_off;
+  if (*p != ',') return std_off; p++;
+  if (!tz_parse_rule(p, em, ew, edow, ets)) return std_off;
+
+  int  Y = tz_year_from_days((long)utc / 86400);
+  long start_utc = tz_rule_civil_secs(Y, sm, sw, sdow, sts) - (long)std_off * 60;  // switch at local std
+  long end_utc   = tz_rule_civil_secs(Y, em, ew, edow, ets) - (long)dst_off * 60;  // switch at local dst
+  long now = (long)utc;
+  bool in_dst = (start_utc < end_utc) ? (now >= start_utc && now < end_utc)        // N. hemisphere
+                                      : (now >= start_utc || now < end_utc);       // S. hemisphere
+  return in_dst ? dst_off : std_off;
 }
 
 // Serialize the cached config as the canonical /config response body.
@@ -587,10 +685,15 @@ static void handle_config()
     changed = true;
   }
   if (cfg_get(doc, json, "time_zone", v)) {
-    // The UI value is "IANA|POSIX-TZ"; derive the standard offset from the POSIX part.
+    // The UI value is "IANA|POSIX-TZ". Apply the EFFECTIVE (DST-aware) offset right
+    // away when the clock is synced so the change shows immediately (the loop's
+    // periodic re-check then handles the twice-yearly DST flip); fall back to the
+    // standard offset before first time sync.
     int bar = v.indexOf('|');
     String posix = (bar >= 0) ? v.substring(bar + 1) : v;
-    int off = posix_tz_offset_min(posix.c_str());
+    int off = (s_clock && s_clock->valid())
+                ? lite_tz_offset_min(posix.c_str(), s_clock->nowUtc(millis()))
+                : posix_tz_offset_min(posix.c_str());
     LiteClockConfig cc; lite_config_load_clock(cc);
     cc.time_zone = v.c_str(); cc.tz_offset_min = off; lite_config_save_clock(cc);
     s_timeZone = v.c_str();
@@ -859,6 +962,22 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
 void web_server_lite_loop()
 {
   s_server.handleClient();
+
+  // Keep the clock's UTC offset DST-correct from the configured POSIX TZ. Re-checked
+  // ~once a minute (the effective offset only flips at the twice-yearly boundary); both
+  // nowLocal() users — the /status local_time and the time-of-day schedule — follow it.
+  if (s_clock && s_clock->valid() && s_timeZone.length()) {
+    static uint32_t s_tzCheckMs = 0;
+    uint32_t nowMs = millis();
+    if (s_tzCheckMs == 0 || (nowMs - s_tzCheckMs) >= 60000u) {
+      s_tzCheckMs = nowMs;
+      int bar = s_timeZone.indexOf('|');
+      if (bar >= 0) {
+        int eff = lite_tz_offset_min(s_timeZone.c_str() + bar + 1, s_clock->nowUtc(nowMs));
+        if (eff != s_clock->tzOffsetMinutes()) s_clock->setTzOffsetMinutes(eff);
+      }
+    }
+  }
   if (s_sntpHave && s_clock) {
     s_sntpHave = false;
     s_clock->setEpoch((uint32_t)s_sntpEpoch, millis());
