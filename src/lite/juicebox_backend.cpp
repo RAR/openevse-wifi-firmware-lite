@@ -2,6 +2,7 @@
 #include "juicebox_backend.h"
 #include <string.h>
 #include "lt_family.h"   // USART0 register access (em_device) — RX-wedge diagnostics
+#include "lite_console.h"   // /evse/console live mirror of the $/~ wire
 
 // Read-and-clear the USART0 RX ring-overflow flag (silabs core; declared in the core's
 // SerialPrivate.h, which app code doesn't include). True => the RX IRQ had to drop bytes
@@ -34,6 +35,15 @@ void JuiceBoxBackend::loop() {
   while (_port.available() > 0) {
     int b = _port.read();
     if (b < 0) break;
+    // Mirror the raw RX byte to /evse/console, line-buffered: append until LF (or
+    // the buffer fills), then flush one whole frame. Always buffer (cheap) so line
+    // framing is correct regardless of when a console connects; only the flush is gated.
+    if (_rxLineLen < sizeof(_rxLine) - 1) _rxLine[_rxLineLen++] = (char)b;
+    if (b == '\n' || _rxLineLen >= sizeof(_rxLine) - 1) {
+      if (lite_console_has_client(LITE_CONSOLE_EVSE))
+        lite_console_broadcast(LITE_CONSOLE_EVSE, (const uint8_t *)_rxLine, _rxLineLen);
+      _rxLineLen = 0;
+    }
     if (_parser.feed((uint8_t)b, f)) {
       _lastRxMillis = millis();
       _everRx = true;
@@ -53,10 +63,13 @@ void JuiceBoxBackend::loop() {
   // production each unit differs. UNVALIDATED for charging — GFI HW fault gates that anyway.)
   if (_everRx && !_identified) {
     // LF (\n) only — byte-faithful to the OEM (its console staircases = LF without CR).
-    _port.print("~MDCRI:EMWERK-JB201-1.0.46, Gecko_OS-STANDARD-4.2.7-11064, WGM160P\n");
-    _port.print("~MDCRI:Zn UUID EADE2FF30BE60E508EF4C515F4B3B1FFFEA21297\n");
-    _port.print("~MDCRI:JNetID:<0910040100000500000000620001>\n");
-    _port.print("~MDCRI:EMM SERIAL:<  17EMOTORWERKS00030>\n");
+    static const char *kIdentity[] = {
+      "~MDCRI:EMWERK-JB201-1.0.46, Gecko_OS-STANDARD-4.2.7-11064, WGM160P\n",
+      "~MDCRI:Zn UUID EADE2FF30BE60E508EF4C515F4B3B1FFFEA21297\n",
+      "~MDCRI:JNetID:<0910040100000500000000620001>\n",
+      "~MDCRI:EMM SERIAL:<  17EMOTORWERKS00030>\n",
+    };
+    for (const char *line : kIdentity) { _port.print(line); txMirror(line); }
     _identified = true;
 #ifdef JB_DEBUG
     LT_I("JBTX(~): #MDCRI identity burst (FW/UUID/JNetID/serial)");
@@ -146,6 +159,7 @@ void JuiceBoxBackend::handleFrame(const JuiceBoxFrame &f) {
   if (f.start == '~') {
     if (!strcmp(f.type, "JV") && f.payload[0] == '?') {
       _port.print("~JV:!1$\n");   // LF only, matching the OEM line terminator
+      txMirror("~JV:!1$\n");
 #ifdef JB_DEBUG
       LT_I("JBTX(~): #JV:!1#  (reply to ~JV:? version query)");
 #endif
@@ -154,6 +168,13 @@ void JuiceBoxBackend::handleFrame(const JuiceBoxFrame &f) {
   }
   if      (!strcmp(f.type, "ES")) {
     juicebox_parse_es(f.payload, f.len, _status);
+    if (_status.state != _dbgState) {   // device state edge -> /debug/console firmware event
+      lite_console_debugf("evse state 0x%02X -> 0x%02X (%s) A=%d pilotV=%d",
+                          _dbgState, _status.state,
+                          lite_evse_state_name(juicebox_map_state(_status.state)),
+                          _status.amps, _status.h);
+      _dbgState = _status.state;
+    }
 #ifdef JB_DEBUG
     // Decoded view so we can SEE the live mapping. The wire letters are misleading
     // (SERIAL_PROTOCOL.md §2a) — labels below show the REAL meaning. S is hex.
@@ -165,9 +186,11 @@ void JuiceBoxBackend::handleFrame(const JuiceBoxFrame &f) {
   else if (!strcmp(f.type, "HW")) { copy_bounded(_hw, sizeof(_hw), f.payload, f.len); }
   else if (!strcmp(f.type, "FW")) { copy_bounded(_fw, sizeof(_fw), f.payload, f.len); }
   else if (!strcmp(f.type, "PV")) { copy_bounded(_pv, sizeof(_pv), f.payload, f.len); }
-  else if (!strcmp(f.type, "MD")) { copy_bounded(_md, sizeof(_md), f.payload, f.len); }
+  else if (!strcmp(f.type, "MD")) { copy_bounded(_md, sizeof(_md), f.payload, f.len);
+                                    lite_console_debugf("evse note: %s", _md); }
   else if (!strcmp(f.type, "WC")) { copy_bounded(_wc, sizeof(_wc), f.payload, f.len); }
-  else if (!strcmp(f.type, "WR")) { copy_bounded(_wr, sizeof(_wr), f.payload, f.len); }
+  else if (!strcmp(f.type, "WR")) { copy_bounded(_wr, sizeof(_wr), f.payload, f.len);
+                                    lite_console_debugf("evse report: %s", _wr); }
   // other types ignored this slice
 }
 
@@ -183,9 +206,17 @@ void JuiceBoxBackend::sendKeepalive() {
   // and are sent on demand when we drive current, not as the heartbeat. (Charge control still
   // UNVALIDATED on HW: the GFI/No-GND self-test gates the contactor on this bench regardless.)
   _port.print("~MDNFO:V1:65535/A1:65535\n");   // LF only, matching the OEM line terminator
+  txMirror("~MDNFO:V1:65535/A1:65535\n");
 #ifdef JB_DEBUG
   LT_I("JBTX(~): #MDNFO:V1:65535/A1:65535  (~ keepalive)");
 #endif
+}
+
+// Mirror exactly `s` (whatever was written to the UART, terminator included) to the
+// /evse/console live stream. Byte-faithful; a no-op (one cheap check) when unwatched.
+void JuiceBoxBackend::txMirror(const char *s) {
+  if (s && *s && lite_console_has_client(LITE_CONSOLE_EVSE))
+    lite_console_broadcast(LITE_CONSOLE_EVSE, (const uint8_t *)s, strlen(s));
 }
 
 // Build a CRC-trailered WiFi->MCU command frame and write it to the UART (LF-terminated,
@@ -193,8 +224,10 @@ void JuiceBoxBackend::sendKeepalive() {
 void JuiceBoxBackend::sendFrame(const char *type, const char *payload) {
   char buf[48];
   if (juicebox_build_frame(type, payload, buf, sizeof(buf))) {
+    size_t n = strlen(buf);
+    if (n + 1 < sizeof(buf)) { buf[n] = '\n'; buf[n + 1] = '\0'; }  // fold LF in so TX is one mirror
     _port.print(buf);
-    _port.print('\n');
+    txMirror(buf);
 #ifdef JB_DEBUG
     char safe[48]; jb_log_safe(safe, sizeof(safe), buf);   // obscure '$' (none here, but safe)
     LT_I("JBTX(~): %s", safe);
@@ -208,9 +241,17 @@ void JuiceBoxBackend::sendFrame(const char *type, const char *payload) {
 void JuiceBoxBackend::sendSetpoints() {
   int amps = _chargeLimit < 0 ? 0 : _chargeLimit;
   char buf[48];
-  if (juicebox_build_amps_set(amps, buf, sizeof(buf)))      { _port.print(buf); _port.print('\n'); }
-  if (juicebox_build_offline_limit(amps, buf, sizeof(buf))) { _port.print(buf); _port.print('\n'); }
-  if (juicebox_build_lock(!_enabled, buf, sizeof(buf)))     { _port.print(buf); _port.print('\n'); }
+  // Each builder writes a frame; fold in the LF, send, and mirror to /evse/console.
+  auto emit = [this, &buf](bool built) {
+    if (!built) return;
+    size_t n = strlen(buf);
+    if (n + 1 < sizeof(buf)) { buf[n] = '\n'; buf[n + 1] = '\0'; }
+    _port.print(buf);
+    txMirror(buf);
+  };
+  emit(juicebox_build_amps_set(amps, buf, sizeof(buf)));
+  emit(juicebox_build_offline_limit(amps, buf, sizeof(buf)));
+  emit(juicebox_build_lock(!_enabled, buf, sizeof(buf)));
 #ifdef JB_DEBUG
   LT_I("JBTX(~): ~AL/~OL=%d ~LK=%s", amps, _enabled ? "00(enable)" : "01(stop)");
 #endif
@@ -225,6 +266,16 @@ void JuiceBoxBackend::addStatusFields(JsonDocument &doc) const {
   if (_wc[0]) doc["wc"]       = _wc;
   if (_wr[0]) doc["wr"]       = _wr;
   doc["line"] = _status.line;          // raw JB L field (semantics unknown per RE)
+
+  // Refine the OpenEVSE numeric state for faults. web_server_lite set a blanket 8
+  // (LiteEvseState::Error) — but the JuiceBox $WR code tells us WHICH fault, so map
+  // it to the closest OpenEVSE code (No GND->7, GFI test->9, relay->8, lockout->6,
+  // pilot->5). Keeps OpenEVSE-shaped consumers (UI label table, Home Assistant) from
+  // mislabelling every fault "stuck relay". Exact text stays in `wr` for the UI.
+  if (getState() == LiteEvseState::Error && _wr[0]) {
+    int wrCode = juicebox_wr_code(_wr);
+    if (wrCode >= 0) doc["state"] = juicebox_fault_openevse_state(wrCode);
+  }
 
   // RX-health (diagnostic): comms_online mirrors isOnline(); rx_age_ms is time since the
   // last framed inbound message; rx_frames counts all framed messages; rx_overflow counts

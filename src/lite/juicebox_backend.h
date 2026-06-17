@@ -44,6 +44,7 @@ private:
   void sendKeepalive();
   void sendFrame(const char *type, const char *payload);   // CRC-trailered ~ command/query
   void sendSetpoints();                                     // ~AL current / ~OL fallback / ~LK gate
+  void txMirror(const char *s);                             // mirror exact TX bytes to /evse/console
 
   Stream        &_port;
   JuiceBoxParser _parser;
@@ -60,6 +61,11 @@ private:
   // rx_overflow climbing = the receive ring can't keep up (TX/log contention on the UART).
   unsigned long  _rxFrames      = 0;
   unsigned long  _rxOverflows   = 0;
+  // /evse/console RX mirror: bytes are line-buffered here and flushed to the
+  // console on LF (or when full) so the live console shows whole $/~ frames.
+  char           _rxLine[96]    = {0};
+  size_t         _rxLineLen     = 0;
+  uint8_t        _dbgState      = 0xFF;   // last ES state mirrored to /debug/console (edge detect)
   bool           _identified    = false;   // sent ~MDCRI identify on the ~ channel once
   bool           _handshakeDone  = false;  // sent the one-shot ~PV/query/setpoint handshake
   bool           _cmdDirty       = true;   // setpoint changed -> push ~AL/~OL/~LK next loop

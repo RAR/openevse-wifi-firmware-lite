@@ -23,6 +23,7 @@
 #include "lite_divert.h"
 #include "lite_shaper.h"
 #include "lite_provision.h"
+#include "lite_console.h"
 #include "web_ui_lite.h"
 #include "lwip/apps/sntp.h"
 
@@ -952,6 +953,7 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
   s_server.on("/scan", handle_scan);
   s_server.on("/connect", handle_connect);
   s_server.on("/update", HTTP_POST, handle_update_done, handle_update_upload);
+  lite_console_begin(s_server);   // /evse/console + /debug/console (WebSocket); also collectHeaders
   s_server.onNotFound(handle_not_found);
   s_server.begin();
   sntp_setoperatingmode(SNTP_OPMODE_POLL);
@@ -962,6 +964,47 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
 void web_server_lite_loop()
 {
   s_server.handleClient();
+  lite_console_loop();   // reap closed console sockets, drain inbound
+
+  // /debug/console liveness. Its other events (ES-state edges, $WR/$MD) are sparse,
+  // so an idle unit would show an empty console. Emit a one-shot banner the moment a
+  // debug client connects, then a heartbeat every 5 s while connected — so the console
+  // is always informative within a few seconds of opening, never dead-looking.
+  if (s_mgr_ctrl) {
+    static bool     s_dbgWas  = false;
+    static uint32_t s_dbgHbMs = 0;
+    bool     dbg = lite_console_has_client(LITE_CONSOLE_DEBUG);
+    uint32_t now = millis();
+    if (dbg && !s_dbgWas) {
+      lite_console_debugf("=== %s debug console — id=%s heap=%u uptime=%lus reset=%s ===",
+                          LITE_FW_VERSION, ESPAL.getShortId().c_str(),
+                          (unsigned)ESPAL.getFreeHeap(), (unsigned long)(now / 1000),
+                          ESPAL.getRebootReason().c_str());
+      s_dbgHbMs = now;   // first heartbeat one interval after the banner
+    }
+    s_dbgWas = dbg;
+    if (dbg && (now - s_dbgHbMs) >= 5000u) {
+      s_dbgHbMs = now;
+      lite_console_debugf("hb uptime=%lus heap=%u evse_state=%d amps=%d set=%dA charging=%d",
+                          (unsigned long)(now / 1000), (unsigned)ESPAL.getFreeHeap(),
+                          s_mgr_ctrl->getEvseState(), s_mgr_ctrl->getAmps(),
+                          (int)s_mgr_ctrl->getChargeCurrent(), s_mgr_ctrl->isCharging() ? 1 : 0);
+    }
+  }
+
+  // /ws live status push: while a WebSocket client is connected, push the full
+  // /status JSON every ~1.5 s (the UI merges each message into its store). This
+  // supplants HTTP polling for that session; if the socket drops, the UI falls
+  // back to polling on its own. ping/pong is handled in lite_console_loop().
+  if (s_mgr_ctrl && lite_console_has_client(LITE_CONSOLE_WS)) {
+    static uint32_t s_wsPushMs = 0;
+    uint32_t now = millis();
+    if (s_wsPushMs == 0 || (now - s_wsPushMs) >= 1500u) {
+      s_wsPushMs = now;
+      String js; build_status_json(js);
+      lite_console_broadcast(LITE_CONSOLE_WS, (const uint8_t *)js.c_str(), js.length());
+    }
+  }
 
   // Keep the clock's UTC offset DST-correct from the configured POSIX TZ. Re-checked
   // ~once a minute (the effective offset only flips at the twice-yearly boundary); both
