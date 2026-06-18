@@ -95,4 +95,18 @@ bool lite_config_save_rfid(const LiteRfidConfig &in);
 // RFID UID->name map (Labs "users" feature), persisted as a JSON-object string.
 bool lite_config_load_rfid_users(String &out);   // out="" if unset; true if present
 bool lite_config_save_rfid_users(const String &in);
+
+// Temperature-throttle config (mirrors upstream temp_throttle keys). Persisted
+// per-key: temp_throttle_enabled (int 0/1) + temp_throttle_setpoint (int deg C).
+struct LiteTempThrottleConfig {
+  bool enabled;   // default false
+  int  setpoint;  // default 65 (TEMP_THROTTLE_SETPOINT_DEFAULT)
+};
+bool lite_config_load_temp_throttle(LiteTempThrottleConfig &out); // fills defaults; true if any key present
+bool lite_config_save_temp_throttle(const LiteTempThrottleConfig &in);
+
+// Persisted default session limit (mirrors upstream limit_default_type/value). The
+// runtime limit itself is volatile (set via POST /limit); only the boot default persists.
+bool lite_config_load_limit_default(String &type_out, int &value_out); // false if unset
+bool lite_config_save_limit_default(const String &type, int value);
 #endif

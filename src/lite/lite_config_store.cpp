@@ -311,4 +311,47 @@ bool lite_config_save_rfid_users(const String &in)
   return fdb_kv_set_blob(&s_kvdb, "rfid_users",
                          fdb_blob_make(&blob, in.c_str(), in.length() + 1)) == FDB_NO_ERR;
 }
+
+// --- Temperature-throttle config ---
+
+bool lite_config_load_temp_throttle(LiteTempThrottleConfig &out)
+{
+  out.enabled  = false;   // defaults
+  out.setpoint = 65;
+  if (!s_ready) return false;
+  bool any = false;
+  int en = 0, sp = 65;
+  if (kv_get_int("temp_throttle_enabled", en))  { out.enabled = (en != 0); any = true; }
+  if (kv_get_int("temp_throttle_setpoint", sp)) { out.setpoint = sp;       any = true; }
+  return any;
+}
+
+bool lite_config_save_temp_throttle(const LiteTempThrottleConfig &in)
+{
+  if (!s_ready) return false;
+  bool ok = kv_set_int("temp_throttle_enabled", in.enabled ? 1 : 0);
+  ok = kv_set_int("temp_throttle_setpoint", in.setpoint) && ok;
+  return ok;
+}
+
+// --- Default session limit ---
+
+bool lite_config_load_limit_default(String &type_out, int &value_out)
+{
+  if (!s_ready) return false;
+  String t;
+  if (!kv_get_str("limit_default_type", t) || t.length() == 0) return false;
+  type_out = t;
+  int v = 0;
+  value_out = kv_get_int("limit_default_value", v) ? v : 0;
+  return true;
+}
+
+bool lite_config_save_limit_default(const String &type, int value)
+{
+  if (!s_ready) return false;
+  bool ok = kv_set_str("limit_default_type", type);
+  ok = kv_set_int("limit_default_value", value) && ok;
+  return ok;
+}
 #endif

@@ -24,6 +24,8 @@
 #include "lite_rfid_policy.h"
 #include "lite_divert.h"
 #include "lite_shaper.h"
+#include "lite_temp_throttle.h"
+#include "lite_limit.h"
 #include "lite_provision.h"
 #include "lite_console.h"
 #include "web_ui_lite.h"
@@ -99,6 +101,23 @@ static LiteDivertConfig s_divertCfg = { false, 0, 1.1, 20, 600, 600 }; // upstre
 
 // Load-shaper config cached in RAM. Seeded at begin() from the store (or upstream defaults).
 static LiteShaperConfig s_shaperCfg = { false, 0, 60, 120, 300 }; // upstream defaults
+
+// Temperature throttle: derate the commanded charge current as the unit heats,
+// claiming at Priority_Safety. Config cached in RAM, mutated by /config; ramp state
+// carried across the 30 s ticks in the loop.
+static LiteTempThrottleConfig s_ttCfg    = { false, 65 };
+static LiteTempThrottleState  s_ttState  = { 0, 0 };
+static uint32_t               s_ttLastMs = 0;
+static const uint32_t         LITE_TEMP_THROTTLE_INTERVAL_MS = 30000;
+
+// Session limit (/limit): stop charging once a time/energy/soc/range threshold is
+// hit (Disabled claim @ Priority_Limit). Runtime props are volatile; only the boot
+// default persists. soc/range are inert until vehicle telemetry exists.
+static LiteLimitProps s_limit            = { LiteLimitType::None, 0, true };
+static uint32_t       s_limitVersion     = 0;
+static bool           s_limitWasCharging = false;
+static uint32_t       s_limitLastMs      = 0;
+static const uint32_t LITE_LIMIT_INTERVAL_MS = 1000;
 
 // MQTT telemetry publisher + its config (loaded in begin, mutated by /config).
 static LiteMqtt       s_mqtt;
@@ -284,6 +303,53 @@ static void override_get_json(String &out) {
   serializeJson(doc, out);
 }
 
+// ---- /limit (session-limit) ----------------------------------------------------------
+// POST body: {"type":"time|energy|soc|range","value":N,"auto_release":bool}. Valid only
+// when type != none && value > 0 (mirrors upstream LimitProperties::deserialize).
+static bool limit_parse(const char *body, size_t len, LiteLimitProps &out)
+{
+  StaticJsonDocument<128> doc;
+  if (deserializeJson(doc, body, len) != DeserializationError::Ok) return false;
+  LiteLimitType t = lite_limit_type_from_string(doc["type"] | "none");
+  uint32_t val = doc["value"] | 0u;
+  if (t == LiteLimitType::None || val == 0) return false;
+  out.type         = t;
+  out.value        = val;
+  out.auto_release = doc["auto_release"] | true;
+  return true;
+}
+
+static void limit_get_json(String &out)
+{
+  StaticJsonDocument<128> doc;
+  if (s_limit.type != LiteLimitType::None) {
+    doc["type"]         = lite_limit_type_to_string(s_limit.type);
+    doc["value"]        = s_limit.value;
+    doc["auto_release"] = s_limit.auto_release;
+  }
+  serializeJson(doc, out);   // {} when no limit set
+}
+
+static void handle_limit() {
+  int code = 200; String body;
+  if (s_server.method() == HTTP_POST) {
+    String b = s_server.arg("plain");
+    LiteLimitProps p;
+    if (limit_parse(b.c_str(), b.length(), p)) {
+      s_limit = p; s_limitVersion++;
+      code = 201; body = "{\"msg\":\"Created\"}";
+    } else { code = 400; body = "{\"msg\":\"Failed to parse JSON\"}"; }
+  } else if (s_server.method() == HTTP_DELETE) {
+    s_limit = LiteLimitProps{ LiteLimitType::None, 0, true }; s_limitVersion++;
+    if (s_mgr_ctrl && s_mgr_ctrl->clientHasClaim(EvseClient_OpenEVSE_Limit))
+      s_mgr_ctrl->release(EvseClient_OpenEVSE_Limit);
+    body = "{\"msg\":\"Deleted\"}";
+  } else {
+    limit_get_json(body);   // GET
+  }
+  s_server.send(code, "application/json", body);
+}
+
 static void handle_override() {
   int code = 200; String body;
   String qs = s_server.arg("state");   // legacy bodyless convenience (any method)
@@ -386,6 +452,10 @@ void web_server_lite_build_status(JsonDocument &doc)
     doc["shaper_cur"]     = s_shaperCur;
     doc["shaper_updated"] = s_shaperUpdated;
 
+    // Temperature throttle (Safety-priority current derate while hot).
+    doc["temp_throttle"]  = s_ttCfg.enabled ? 1 : 0;
+    doc["throttling"]     = s_mgr_ctrl->clientHasClaim(EvseClient_OpenEVSE_TempThrottle) ? 1 : 0;
+
     // Control/claim diagnostics (retained from the prior status body).
     doc["claims"] = (uint32_t)s_mgr_ctrl->activeClaimCount();
     doc["manual"] = manual.isActive() ? 1 : 0;
@@ -418,7 +488,7 @@ void web_server_lite_build_status(JsonDocument &doc)
   doc["claims_version"]        = 0;
   doc["override_version"]      = 0;
   doc["schedule_plan_version"] = 0;
-  doc["limit_version"]         = 0;
+  doc["limit_version"]         = s_limitVersion;
   // Subsystem connection states. mqtt is real on lite; the rest are subsystems a JuiceBox
   // lacks -> honest "not connected" defaults so the UI shows status instead of blanks.
   doc["mqtt_connected"]    = s_mqtt.connected() ? 1 : 0;
@@ -446,7 +516,7 @@ void web_server_lite_build_status(JsonDocument &doc)
   doc["flags"]      = 0;
   doc["colour"]     = 0;
   doc["ota_update"] = 0;
-  doc["limit"]      = false;
+  doc["limit"]      = (s_limit.type != LiteLimitType::None);
 
   if (s_clock && s_clock->valid()) {
     char isobuf[24];
@@ -623,6 +693,8 @@ static void config_json(String &out)
   doc["current_shaper_smoothing_time"]   = s_shaperCfg.smoothing_s;
   doc["current_shaper_data_maxinterval"] = s_shaperCfg.data_maxinterval_s;
   doc["current_shaper_min_pause_time"]   = s_shaperCfg.min_pause_s;
+  doc["temp_throttle_enabled"]           = s_ttCfg.enabled;
+  doc["temp_throttle_setpoint"]          = s_ttCfg.setpoint;
   doc["mqtt_enabled"] = s_mqttCfg.enabled;
   doc["mqtt_server"]  = s_mqttCfg.server;
   doc["mqtt_port"]    = s_mqttCfg.port;
@@ -749,6 +821,20 @@ static void handle_config()
   if (cfg_get(doc, json, "current_shaper_data_maxinterval", v)) { scfg.data_maxinterval_s = (uint32_t)v.toInt(); sany = true; }
   if (cfg_get(doc, json, "current_shaper_min_pause_time", v))   { scfg.min_pause_s = (uint32_t)v.toInt(); sany = true; }
   if (sany) { lite_config_save_shaper(scfg); s_shaperCfg = scfg; changed = true; }
+
+  LiteTempThrottleConfig tcfg = s_ttCfg; bool tany = false;
+  if (cfg_get(doc, json, "temp_throttle_enabled", v))  { tcfg.enabled  = v.toInt() != 0; tany = true; }
+  if (cfg_get(doc, json, "temp_throttle_setpoint", v)) { tcfg.setpoint = v.toInt();      tany = true; }
+  if (tany) {
+    lite_config_save_temp_throttle(tcfg);
+    s_ttCfg = tcfg;
+    // Turning throttle off drops any active claim and resets the ramp.
+    if (!tcfg.enabled && s_mgr_ctrl && s_mgr_ctrl->clientHasClaim(EvseClient_OpenEVSE_TempThrottle)) {
+      s_mgr_ctrl->release(EvseClient_OpenEVSE_TempThrottle);
+    }
+    if (!tcfg.enabled) { s_ttState.start_current = 0; s_ttState.throttled_current = 0; }
+    changed = true;
+  }
 
   LiteMqttConfig mcfg = s_mqttCfg; bool many = false;
   if (cfg_get(doc, json, "mqtt_enabled", v)) { mcfg.enabled = v.toInt() != 0; many = true; }
@@ -1006,6 +1092,13 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
 
   lite_config_load_divert(s_divertCfg);   // keeps defaults if the key is absent
   lite_config_load_shaper(s_shaperCfg);  // keeps defaults if the key is absent
+  lite_config_load_temp_throttle(s_ttCfg); // keeps defaults (off/65) if absent
+
+  // Seed the boot-default session limit (auto_release=false, like upstream setDefaultLimit).
+  { String lt; int lv = 0;
+    if (lite_config_load_limit_default(lt, lv) && lv > 0) {
+      LiteLimitType t = lite_limit_type_from_string(lt.c_str());
+      if (t != LiteLimitType::None) { s_limit = { t, (uint32_t)lv, false }; } } }
   lite_config_load_wizard(s_wizardPassed); // keeps default false if never set (shows wizard)
 
   lite_config_load_mqtt(s_mqttCfg);       // fills defaults if absent (disabled by default)
@@ -1019,6 +1112,7 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
   s_server.on("/status", handle_status);
   s_server.on("/config", handle_config);
   s_server.on("/override", handle_override);
+  s_server.on("/limit", handle_limit);
   s_server.on("/schedule", handle_schedule);
   s_server.on(UriBraces("/schedule/{}"), HTTP_DELETE, handle_schedule_del_path);
   s_server.on("/scan", handle_scan);
@@ -1249,6 +1343,53 @@ void web_server_lite_loop()
     s_mgr_ctrl->release(EvseClient_OpenEVSE_Divert);   // divert turned off -> drop the claim
     s_divertState.smoothed_available = 0;
     s_divertChargeRate = 0;
+  }
+
+  // Temperature throttle: tick every 30 s. Ramps the commanded charge current down as
+  // the unit heats (Priority_Safety) and recovers + releases as it cools. The pure tick
+  // captures the pre-throttle pilot once on engage, then drives its own ramp state.
+  uint32_t now_ctl = millis();
+  if (s_mgr_ctrl && (s_ttLastMs == 0 || now_ctl - s_ttLastMs >= LITE_TEMP_THROTTLE_INTERVAL_MS)) {
+    s_ttLastMs = now_ctl;
+    LiteTempThrottleCfg tc{ s_ttCfg.setpoint, s_mgr_ctrl->getMinCurrent() };
+    LiteTempThrottleResult tr = lite_temp_throttle_tick(
+        tc, s_ttState, s_ttCfg.enabled, s_mgr_ctrl->isTemperatureValid(),
+        s_mgr_ctrl->getTemperature(), s_mgr_ctrl->isCharging(),
+        s_mgr_ctrl->getChargeCurrent());
+    if (tr.action == LiteTempThrottleAction::Claim) {
+      EvseProperties p; p.setChargeCurrent(tr.charge_current);
+      s_mgr_ctrl->claim(EvseClient_OpenEVSE_TempThrottle, EvseManager_Priority_Safety, p);
+    } else if (tr.action == LiteTempThrottleAction::Release &&
+               s_mgr_ctrl->clientHasClaim(EvseClient_OpenEVSE_TempThrottle)) {
+      s_mgr_ctrl->release(EvseClient_OpenEVSE_TempThrottle);
+    }
+  }
+
+  // Session limit: tick every 1 s. Disable charging once the active limit is reached;
+  // on the charge->idle edge release the claim and (if auto_release) clear the limit.
+  if (s_mgr_ctrl && now_ctl - s_limitLastMs >= LITE_LIMIT_INTERVAL_MS) {
+    s_limitLastMs = now_ctl;
+    bool charging = s_mgr_ctrl->isCharging();
+
+    if (s_limitWasCharging && !charging) {   // session complete
+      if (s_mgr_ctrl->clientHasClaim(EvseClient_OpenEVSE_Limit))
+        s_mgr_ctrl->release(EvseClient_OpenEVSE_Limit);
+      if (s_limit.auto_release && s_limit.type != LiteLimitType::None) {
+        s_limit = LiteLimitProps{ LiteLimitType::None, 0, true }; s_limitVersion++;
+      }
+    }
+    s_limitWasCharging = charging;
+
+    if (s_limit.type != LiteLimitType::None) {
+      if (charging &&
+          lite_limit_reached(s_limit, s_mgr_ctrl->getSessionElapsed(),
+                             s_mgr_ctrl->getSessionWattHours(), -1, -1)) {
+        EvseProperties p(EvseState::Disabled); p.setAutoRelease(true);
+        s_mgr_ctrl->claim(EvseClient_OpenEVSE_Limit, EvseManager_Priority_Limit, p);
+      }
+    } else if (s_mgr_ctrl->clientHasClaim(EvseClient_OpenEVSE_Limit)) {
+      s_mgr_ctrl->release(EvseClient_OpenEVSE_Limit);
+    }
   }
 
   // MQTT telemetry: per-field publish on cadence (faster while charging). No-op when
