@@ -20,6 +20,8 @@
 #include "lite_openevse_compat.h"
 #include "lite_feed.h"
 #include "lite_mqtt.h"
+#include "lite_rfid.h"
+#include "lite_rfid_policy.h"
 #include "lite_divert.h"
 #include "lite_shaper.h"
 #include "lite_provision.h"
@@ -101,6 +103,11 @@ static LiteShaperConfig s_shaperCfg = { false, 0, 60, 120, 300 }; // upstream de
 // MQTT telemetry publisher + its config (loaded in begin, mutated by /config).
 static LiteMqtt       s_mqtt;
 static LiteMqttConfig s_mqttCfg;
+
+// RFID reader + its config (loaded in begin, mutated by /config). Gates charging
+// via the EvseManager claim stack; live status in g_lite_rfid_status.
+static LiteRfid       s_rfid;
+static LiteRfidConfig s_rfidCfg;
 
 // Pushed sensor feed (3c POST /status). Read by the divert/shaper glue below.
 static LiteFeed s_feed;
@@ -416,7 +423,16 @@ void web_server_lite_build_status(JsonDocument &doc)
   doc["mqtt_connected"]    = s_mqtt.connected() ? 1 : 0;
   doc["emoncms_connected"] = 0;
   doc["ocpp_connected"]    = 0;
-  doc["rfid_failure"]      = 0;
+  // RFID: rfid_failure mirrors the upstream "reader expected but not responding"
+  // flag (reader enabled but self-test failed). The extra fields drive the UI's
+  // RFID card + the per-session attribution (memory: ha-data-sources / PR#1037).
+  doc["rfid_failure"]  = (g_lite_rfid_status.enabled && !g_lite_rfid_status.reader_ok) ? 1 : 0;
+  doc["rfid_enabled"]  = g_lite_rfid_status.enabled;
+  doc["rfid_auth"]     = g_lite_rfid_status.authorized ? 1 : 0;
+  if (g_lite_rfid_status.last_uid[0]) {
+    doc["rfid"]          = g_lite_rfid_status.last_uid;        // last scanned UID (hex)
+    doc["rfid_allowed"]  = g_lite_rfid_status.last_allowed ? 1 : 0;
+  }
   doc["ohm_hour"]          = "NotConnected";
   doc["packets_sent"]      = 0;
   doc["packets_success"]   = 0;
@@ -462,7 +478,7 @@ void web_server_lite_build_status(JsonDocument &doc)
 
 static void build_status_json(String &out)
 {
-  StaticJsonDocument<3072> doc;   // bumped 1280->1792->3072 as the field set grew (canonical
+  StaticJsonDocument<3584> doc;   // bumped 1280->1792->3072->3584 as the field set grew (canonical
                                   // /status alignment); undersizing silently drops trailing fields
   web_server_lite_build_status(doc);
   serializeJson(doc, out);
@@ -590,7 +606,7 @@ static int lite_tz_offset_min(const char *tz, uint32_t utc) {
 // Serialize the cached config as the canonical /config response body.
 static void config_json(String &out)
 {
-  StaticJsonDocument<1024> doc;   // headroom for long broker host/topic/user values
+  StaticJsonDocument<2048> doc;   // headroom for long broker values + the RFID allow-list
   doc["max_current_soft"] = s_cfg.max_current_soft;
   doc["max_current_hard"] = s_cfg.max_current_hard;
   doc["divert_enabled"]               = s_divertCfg.enabled;
@@ -611,6 +627,8 @@ static void config_json(String &out)
   doc["mqtt_user"]    = s_mqttCfg.user;
   doc["mqtt_period"]  = s_mqttCfg.period_s;
   // mqtt_pass intentionally NOT echoed; a present non-empty mqtt_pass on POST replaces it.
+  doc["rfid_enabled"]   = s_rfidCfg.enabled;
+  doc["rfid_allowlist"] = s_rfidCfg.allowlist;   // delimited UID-hex list
   doc["wizard_passed"] = s_wizardPassed;   // first-run gate; App.svelte shows the wizard until true
   // Firmware versions for the UI's About/Firmware pages, which read them from
   // /config (not /status): "version" = WiFi gateway (this lite fw), "firmware" =
@@ -739,6 +757,11 @@ static void handle_config()
   // length > 0 on the form path), so re-saving with a blank pass keeps the stored one.
   if (cfg_get(doc, json, "mqtt_pass", v) && v.length()) { mcfg.pass = v;       many = true; }
   if (many) { lite_config_save_mqtt(mcfg); s_mqttCfg = mcfg; s_mqtt.reconfigure(mcfg); changed = true; }
+
+  LiteRfidConfig rcfg = s_rfidCfg; bool rany = false;
+  if (cfg_get(doc, json, "rfid_enabled", v))   { rcfg.enabled   = v.toInt() != 0; rany = true; }
+  if (cfg_get(doc, json, "rfid_allowlist", v)) { rcfg.allowlist = v;              rany = true; }
+  if (rany) { lite_config_save_rfid(rcfg); s_rfidCfg = rcfg; s_rfid.reconfigure(rcfg); changed = true; }
 
   // First-run setup gate: the web UI's wizard finish POSTs wizard_passed:true.
   if (cfg_get(doc, json, "wizard_passed", v)) {
@@ -944,6 +967,9 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
   lite_config_load_mqtt(s_mqttCfg);       // fills defaults if absent (disabled by default)
   s_mqtt.begin(s_mqttCfg, ESPAL.getShortId(), LITE_FW_VERSION);
 
+  lite_config_load_rfid(s_rfidCfg);       // fills defaults if absent (disabled by default)
+  s_rfid.begin(mgr, s_rfidCfg);           // gates charging via the claim stack (inert until pins confirmed)
+
   s_server.on("/", handle_root);
   s_server.on("/status", handle_status);
   s_server.on("/config", handle_config);
@@ -965,6 +991,7 @@ void web_server_lite_loop()
 {
   s_server.handleClient();
   lite_console_loop();   // reap closed console sockets, drain inbound
+  s_rfid.loop();         // poll the CLRC663, run the swipe->claim decision (self-rate-limited)
 
   // /debug/console liveness. Its other events (ES-state edges, $WR/$MD) are sparse,
   // so an idle unit would show an empty console. Emit a one-shot banner the moment a

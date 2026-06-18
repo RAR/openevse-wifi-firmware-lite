@@ -81,4 +81,14 @@ struct LiteMqttConfig {
 };
 bool lite_config_load_mqtt(LiteMqttConfig &out);  // fills defaults; true if any key present
 bool lite_config_save_mqtt(const LiteMqttConfig &in);
+
+// RFID reader config. Persisted per-key: rfid_enabled (int 0/1) + rfid_allowlist
+// (a comma/space/newline-delimited UID-hex list; can exceed the 64-byte short-string
+// buffer, so it gets its own larger-buffer accessor). Key names match the /config API.
+struct LiteRfidConfig {
+  bool   enabled;     // default false
+  String allowlist;   // default "" (delimited UID hex list, e.g. "678C4264,DEADBEEF")
+};
+bool lite_config_load_rfid(LiteRfidConfig &out);  // fills defaults; true if any key present
+bool lite_config_save_rfid(const LiteRfidConfig &in);
 #endif

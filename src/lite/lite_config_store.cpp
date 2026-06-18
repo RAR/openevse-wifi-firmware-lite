@@ -259,4 +259,33 @@ bool lite_config_save_mqtt(const LiteMqttConfig &in)
   ok = kv_set_int("mqtt_period", (int)in.period_s)     && ok;
   return ok;
 }
+
+// --- RFID config (allowlist needs a bigger buffer than kv_get_str's 64 bytes) ---
+
+bool lite_config_load_rfid(LiteRfidConfig &out)
+{
+  out.enabled   = false;     // defaults
+  out.allowlist = "";
+  if (!s_ready) return false;
+  bool any = false;
+  int en = 0;
+  if (kv_get_int("rfid_enabled", en)) { out.enabled = (en != 0); any = true; }
+  // Allowlist: up to 16 UIDs * (20 hex + sep) ~ 350 chars; use a generous buffer.
+  char buf[512] = {0};
+  struct fdb_blob blob;
+  fdb_kv_get_blob(&s_kvdb, "rfid_allowlist", fdb_blob_make(&blob, buf, sizeof(buf) - 1));
+  if (blob.saved.len > 0) { buf[sizeof(buf) - 1] = '\0'; out.allowlist = buf; any = true; }
+  return any;
+}
+
+bool lite_config_save_rfid(const LiteRfidConfig &in)
+{
+  if (!s_ready) return false;
+  bool ok = kv_set_int("rfid_enabled", in.enabled ? 1 : 0);
+  struct fdb_blob blob;
+  fdb_err_t err = fdb_kv_set_blob(
+      &s_kvdb, "rfid_allowlist",
+      fdb_blob_make(&blob, in.allowlist.c_str(), in.allowlist.length() + 1));
+  return ok && (err == FDB_NO_ERR);
+}
 #endif
