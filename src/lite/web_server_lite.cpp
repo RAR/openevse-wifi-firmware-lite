@@ -389,6 +389,13 @@ static void status_post_apply(const char *body, size_t len)
   if (doc.containsKey("grid_ie"))         lite_feed_set_grid_ie(s_feed, doc["grid_ie"].as<int>(),         now);
   if (doc.containsKey("voltage"))         lite_feed_set_voltage(s_feed, doc["voltage"].as<double>(),      now);
   if (doc.containsKey("shaper_live_pwr")) lite_feed_set_shaper (s_feed, doc["shaper_live_pwr"].as<int>(), now);
+  // HA-integration push: vehicle SoC/range/ETA + home-battery SoC/power (firstof9/openevse
+  // soc()/home_battery()). No data_src gate (single push source), same as solar/grid above.
+  if (doc.containsKey("battery_level"))       lite_feed_set_vehicle_soc   (s_feed, doc["battery_level"].as<int>(),       now);
+  if (doc.containsKey("battery_range"))       lite_feed_set_vehicle_range (s_feed, doc["battery_range"].as<int>(),       now);
+  if (doc.containsKey("time_to_full_charge")) lite_feed_set_vehicle_eta   (s_feed, doc["time_to_full_charge"].as<int>(), now);
+  if (doc.containsKey("home_battery_soc"))    lite_feed_set_home_battery_soc  (s_feed, doc["home_battery_soc"].as<int>(),   now);
+  if (doc.containsKey("home_battery_power"))  lite_feed_set_home_battery_power(s_feed, doc["home_battery_power"].as<int>(), now);
 }
 
 // Build the /status JSON in the OpenEVSE local-API shape the firstof9/openevse
@@ -547,6 +554,13 @@ void web_server_lite_build_status(JsonDocument &doc)
   if (s_feed.grid_valid)    doc["grid_ie"]         = s_feed.grid_ie_w;
   if (s_feed.voltage_valid) doc["voltage"]         = s_feed.voltage;
   if (s_feed.shaper_valid)  doc["shaper_live_pwr"] = s_feed.shaper_w;
+  // HA push fields, omit-when-absent (0% SoC is real data — never emit a "no data" zero).
+  if (s_feed.veh_soc_valid)   doc["battery_level"]       = s_feed.veh_soc;
+  if (s_feed.veh_range_valid) doc["battery_range"]       = s_feed.veh_range;
+  if (s_feed.veh_eta_valid)   doc["time_to_full_charge"] = s_feed.veh_eta;
+  if (s_feed.veh_soc_valid || s_feed.veh_range_valid) doc["vehicle"] = 1;  // HA "vehicle data present"
+  if (s_feed.hbatt_soc_valid) doc["home_battery_soc"]    = s_feed.hbatt_soc;
+  if (s_feed.hbatt_pwr_valid) doc["home_battery_power"]  = s_feed.hbatt_pwr;
 }
 
 static void build_status_json(String &out)
@@ -1381,9 +1395,12 @@ void web_server_lite_loop()
     s_limitWasCharging = charging;
 
     if (s_limit.type != LiteLimitType::None) {
+      // SoC/range come from the HA push feed (keep-last-good; -1 = unavailable -> inert).
+      int soc = s_feed.veh_soc_valid   ? s_feed.veh_soc   : -1;
+      int rng = s_feed.veh_range_valid ? s_feed.veh_range : -1;
       if (charging &&
           lite_limit_reached(s_limit, s_mgr_ctrl->getSessionElapsed(),
-                             s_mgr_ctrl->getSessionWattHours(), -1, -1)) {
+                             s_mgr_ctrl->getSessionWattHours(), soc, rng)) {
         EvseProperties p(EvseState::Disabled); p.setAutoRelease(true);
         s_mgr_ctrl->claim(EvseClient_OpenEVSE_Limit, EvseManager_Priority_Limit, p);
       }
