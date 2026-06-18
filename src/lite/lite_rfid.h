@@ -22,6 +22,11 @@ public:
   void loop();
   void reconfigure(const LiteRfidConfig &cfg);
 
+  // Enroll/scan window (UI "scan" button -> POST /rfid/add): poll the reader and publish
+  // the next UID into g_lite_rfid_status.last_uid even when rfid is not enabled (no gating).
+  void     startScan(uint32_t window_ms = 60000);
+  uint32_t scanSecondsLeft() const;   // remaining seconds of the scan window (0 = not waiting)
+
 private:
   void blockCharging();      // claim Disabled (gate closed)
   void releaseClaim();       // drop the RFID claim entirely
@@ -34,5 +39,6 @@ private:
   bool      _claimedDisable;
   uint32_t  _lastPollMs;
   bool      _wasVehicle;     // device-state edge: vehicle present last cycle
+  uint32_t  _scanUntilMs = 0; // enroll/scan window deadline (millis); 0 = idle
 };
 #endif

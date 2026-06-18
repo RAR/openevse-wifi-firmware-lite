@@ -16,6 +16,9 @@
 #include "WiFiStatusLed.h"   // ltWifiStatusLedEnable — WiFi lib header, on the path via <WiFi.h>
 #include "manual.h"
 #include "lite_provision.h"
+#ifdef LITE_RFID_SCAN
+#include "lite_rfid_scan.h"
+#endif
 
 #if defined(LITE_EVSE_BACKEND_JUICEBOX)
 #include "juicebox_backend.h"
@@ -54,6 +57,13 @@ static uint32_t s_apSinceMs     = 0;      // millis() when the current AP window
 
 void setup()
 {
+#ifdef LITE_RFID_SCAN
+  // Bench bring-up: sweep candidate GPIOs for the CLRC663 (VERSION==0x18 oracle),
+  // publish the winning pinout in g_rfid_scan_result for SWD read-back, then carry
+  // on with a normal boot so loop() keeps the watchdog fed and RAM intact.
+  lite_rfid_scan_run();
+#endif
+
   // ATmega EVSE-controller RESET (active-low) is wired to host GPIO PF11
   // (continuity-confirmed on the bench 2026-06-13). We previously never configured
   // PF11, so it floated at power-on (EFM32 GPIOs default to disabled/input) and the

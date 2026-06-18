@@ -108,6 +108,7 @@ static LiteMqttConfig s_mqttCfg;
 // via the EvseManager claim stack; live status in g_lite_rfid_status.
 static LiteRfid       s_rfid;
 static LiteRfidConfig s_rfidCfg;
+static String         s_rfidUsers = "{}";   // Labs UID->name map (JSON object string)
 
 // Pushed sensor feed (3c POST /status). Read by the divert/shaper glue below.
 static LiteFeed s_feed;
@@ -429,7 +430,9 @@ void web_server_lite_build_status(JsonDocument &doc)
   doc["rfid_failure"]  = (g_lite_rfid_status.enabled && !g_lite_rfid_status.reader_ok) ? 1 : 0;
   doc["rfid_enabled"]  = g_lite_rfid_status.enabled;
   doc["rfid_auth"]     = g_lite_rfid_status.authorized ? 1 : 0;
+  doc["rfid_waiting"]  = s_rfid.scanSecondsLeft();   // enroll countdown (s); 0 = not waiting
   if (g_lite_rfid_status.last_uid[0]) {
+    doc["rfid_input"]    = g_lite_rfid_status.last_uid;        // gui scan field (Rfid.svelte reads rfid_input)
     doc["rfid"]          = g_lite_rfid_status.last_uid;        // last scanned UID (hex)
     doc["rfid_allowed"]  = g_lite_rfid_status.last_allowed ? 1 : 0;
   }
@@ -628,7 +631,8 @@ static void config_json(String &out)
   doc["mqtt_period"]  = s_mqttCfg.period_s;
   // mqtt_pass intentionally NOT echoed; a present non-empty mqtt_pass on POST replaces it.
   doc["rfid_enabled"]   = s_rfidCfg.enabled;
-  doc["rfid_allowlist"] = s_rfidCfg.allowlist;   // delimited UID-hex list
+  doc["rfid_storage"]   = s_rfidCfg.allowlist;   // gui contract (comma-separated tag list)
+  doc["rfid_allowlist"] = s_rfidCfg.allowlist;   // legacy alias
   doc["wizard_passed"] = s_wizardPassed;   // first-run gate; App.svelte shows the wizard until true
   // Firmware versions for the UI's About/Firmware pages, which read them from
   // /config (not /status): "version" = WiFi gateway (this lite fw), "firmware" =
@@ -760,7 +764,8 @@ static void handle_config()
 
   LiteRfidConfig rcfg = s_rfidCfg; bool rany = false;
   if (cfg_get(doc, json, "rfid_enabled", v))   { rcfg.enabled   = v.toInt() != 0; rany = true; }
-  if (cfg_get(doc, json, "rfid_allowlist", v)) { rcfg.allowlist = v;              rany = true; }
+  if (cfg_get(doc, json, "rfid_storage", v))   { rcfg.allowlist = v;              rany = true; } // gui field
+  if (cfg_get(doc, json, "rfid_allowlist", v)) { rcfg.allowlist = v;              rany = true; } // legacy alias
   if (rany) { lite_config_save_rfid(rcfg); s_rfidCfg = rcfg; s_rfid.reconfigure(rcfg); changed = true; }
 
   // First-run setup gate: the web UI's wizard finish POSTs wizard_passed:true.
@@ -816,6 +821,45 @@ static void handle_scan() {
   WiFi.scanDelete();
   String body; serializeJson(doc, body);
   s_server.send(200, "application/json", body);
+}
+
+// POST /rfid/add  (the UI "scan" button) -> open a 60 s enroll window; the next tag's UID
+// lands in /status as "rfid" with "rfid_waiting" counting down. Mirrors the standard
+// firmware's handleAddRFID so the gui's RFID page can read a card.
+static void handle_rfid_add() {
+  s_rfid.startScan(60000);
+  s_server.send(200, "application/json", "{\"msg\":\"Waiting for badge\"}");
+}
+
+// /rfid/users (Labs): GET -> UID->name JSON map; POST {rfid,name} -> set a name;
+// DELETE ?rfid=<uid> -> remove one. Persisted via lite_config_*_rfid_users.
+static void handle_rfid_users() {
+  if (s_server.method() == HTTP_GET) {
+    s_server.send(200, "application/json", s_rfidUsers.length() ? s_rfidUsers : "{}");
+    return;
+  }
+  StaticJsonDocument<1024> map;
+  if (deserializeJson(map, s_rfidUsers) != DeserializationError::Ok || !map.is<JsonObject>())
+    map.to<JsonObject>();
+
+  if (s_server.method() == HTTP_DELETE) {
+    map.as<JsonObject>().remove(s_server.arg("rfid"));
+  } else {  // POST {rfid, name}
+    StaticJsonDocument<256> in;
+    String plain = s_server.arg("plain");
+    if (!plain.length() || deserializeJson(in, plain) != DeserializationError::Ok) {
+      s_server.send(400, "application/json", "{\"msg\":\"error\"}"); return;
+    }
+    String uid  = in["rfid"] | "";
+    String name = in["name"] | "";
+    if (uid.length() == 0) { s_server.send(400, "application/json", "{\"msg\":\"error\"}"); return; }
+    map[uid] = name;
+  }
+
+  String out; serializeJson(map, out);
+  s_rfidUsers = out;
+  lite_config_save_rfid_users(s_rfidUsers);
+  s_server.send(200, "application/json", "{\"msg\":\"done\"}");
 }
 
 // GET /connect?ssid=&pass= -> save creds, 200, then deferred reboot. WebServer
@@ -968,6 +1012,7 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
   s_mqtt.begin(s_mqttCfg, ESPAL.getShortId(), LITE_FW_VERSION);
 
   lite_config_load_rfid(s_rfidCfg);       // fills defaults if absent (disabled by default)
+  if (!lite_config_load_rfid_users(s_rfidUsers) || s_rfidUsers.length() == 0) s_rfidUsers = "{}";
   s_rfid.begin(mgr, s_rfidCfg);           // gates charging via the claim stack (inert until pins confirmed)
 
   s_server.on("/", handle_root);
@@ -977,6 +1022,8 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
   s_server.on("/schedule", handle_schedule);
   s_server.on(UriBraces("/schedule/{}"), HTTP_DELETE, handle_schedule_del_path);
   s_server.on("/scan", handle_scan);
+  s_server.on("/rfid/add", handle_rfid_add);   // UI "scan" button -> enroll window
+  s_server.on("/rfid/users", handle_rfid_users); // Labs UID->name map (GET/POST/DELETE)
   s_server.on("/connect", handle_connect);
   s_server.on("/update", HTTP_POST, handle_update_done, handle_update_upload);
   lite_console_begin(s_server);   // /evse/console + /debug/console (WebSocket); also collectHeaders

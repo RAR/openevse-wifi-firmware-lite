@@ -288,4 +288,27 @@ bool lite_config_save_rfid(const LiteRfidConfig &in)
       fdb_blob_make(&blob, in.allowlist.c_str(), in.allowlist.length() + 1));
   return ok && (err == FDB_NO_ERR);
 }
+
+// --- RFID UID->name map (JSON-object string; can exceed kv_get_str's 64-byte path) ---
+
+bool lite_config_load_rfid_users(String &out)
+{
+  out = "";
+  if (!s_ready) return false;
+  char buf[1024] = {0};
+  struct fdb_blob blob;
+  fdb_kv_get_blob(&s_kvdb, "rfid_users", fdb_blob_make(&blob, buf, sizeof(buf) - 1));
+  if (blob.saved.len == 0) return false;
+  buf[sizeof(buf) - 1] = '\0';
+  out = buf;
+  return true;
+}
+
+bool lite_config_save_rfid_users(const String &in)
+{
+  if (!s_ready) return false;
+  struct fdb_blob blob;
+  return fdb_kv_set_blob(&s_kvdb, "rfid_users",
+                         fdb_blob_make(&blob, in.c_str(), in.length() + 1)) == FDB_NO_ERR;
+}
 #endif

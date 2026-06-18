@@ -30,32 +30,42 @@
 //  macros below, and add `-D LITE_RFID_PINS_CONFIRMED` to the device build_flags.
 // ============================================================================
 
-// --- placeholder defaults (deliberately NOT real pins; override before enabling) ---
-// These exist only so lite_rfid.cpp compiles while disabled. They are never driven
-// unless LITE_RFID_PINS_CONFIRMED is defined. None of them is PF11 (see conflict).
+// --- CONFIRMED pinout (2026-06-18, live VERSION==0x18 read via J-Link scan) ---------
+// The CLRC663 hangs off a SHARED bit-bang SPI bus (mode 0). These four are the WGM-side
+// pins, verified by lite_rfid_scan.cpp reading VERSION==0x18:
+//   SCLK=PC4  MOSI=PB3  MISO=PB4  CS=PF10
+// PE5 (continuity-found, 330Ω series) is NOT SPI — almost certainly the reader ENABLE/RESET
+// (must be driven HIGH to run; hi-Z left the reader powered down). See LITE_RFID_HAS_PDOWN note.
+//
+// NO BUS CONTENTION (confirmed): the WGM reads VERSION==0x18 with the ATmega RUNNING (PF11 high)
+// just as well as with it in reset → the ATmega does NOT drive this reader bus (its SPI-master
+// code is vestigial/other). The WGM is the sole reader master → lite can bit-bang it anytime,
+// no arbitration. Before flipping LITE_RFID_PINS_CONFIRMED on: wire the ENABLE (PE5, drive HIGH
+// to run — active-high, opposite the PDOWN hook below) and HW-validate read-UID + allowlist + gate.
 #ifndef LITE_RFID_SCLK_PORT
-#define LITE_RFID_SCLK_PORT  gpioPortA
-#define LITE_RFID_SCLK_PIN   0
+#define LITE_RFID_SCLK_PORT  gpioPortC      // PC4 (confirmed)
+#define LITE_RFID_SCLK_PIN   4
 #endif
 #ifndef LITE_RFID_MOSI_PORT
-#define LITE_RFID_MOSI_PORT  gpioPortF      // candidate: PF10 (connector pin 3)
-#define LITE_RFID_MOSI_PIN   10
+#define LITE_RFID_MOSI_PORT  gpioPortB      // PB3 (confirmed)
+#define LITE_RFID_MOSI_PIN   3
 #endif
 #ifndef LITE_RFID_MISO_PORT
-#define LITE_RFID_MISO_PORT  gpioPortB      // candidate: PB4 (Gecko GPIO9, input-pullup)
+#define LITE_RFID_MISO_PORT  gpioPortB      // PB4 (confirmed)
 #define LITE_RFID_MISO_PIN   4
 #endif
 #ifndef LITE_RFID_CS_PORT
-#define LITE_RFID_CS_PORT    gpioPortA      // TBD: the other of PF10/PF11; NOT PF11
-#define LITE_RFID_CS_PIN     1
+#define LITE_RFID_CS_PORT    gpioPortF      // PF10 (confirmed)
+#define LITE_RFID_CS_PIN     10
 #endif
 
-// Optional CLRC663 PDOWN (power-down, active-high; drive LOW to run). Not seen on
-// the 7-pin connector, so it may be hardwired. Leave LITE_RFID_HAS_PDOWN undefined
-// unless tracing finds a host GPIO for it.
-#ifndef LITE_RFID_PDOWN_PORT
-#define LITE_RFID_PDOWN_PORT gpioPortA
-#define LITE_RFID_PDOWN_PIN  2
+// CLRC663 enable/reset = PE5 — ACTIVE-HIGH: drive HIGH to run. (Confirmed: hi-Z left the reader
+// powered down; driving it high is what let the WGM read VERSION==0x18.) This is a drive-HIGH
+// enable, NOT the active-low PDOWN semantics, so it uses its own LITE_RFID_HAS_ENABLE hook.
+#ifndef LITE_RFID_ENABLE_PORT
+#define LITE_RFID_HAS_ENABLE
+#define LITE_RFID_ENABLE_PORT gpioPortE     // PE5
+#define LITE_RFID_ENABLE_PIN  5
 #endif
 
 // Bit-bang half-clock (microseconds). ~2 us => ~250 kHz; conservative for bring-up.

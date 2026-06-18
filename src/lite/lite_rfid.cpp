@@ -23,6 +23,10 @@ static void hw_pins_init()
   GPIO_PinModeSet(LITE_RFID_MOSI_PORT, LITE_RFID_MOSI_PIN, gpioModePushPull, 0);
   GPIO_PinModeSet(LITE_RFID_CS_PORT,   LITE_RFID_CS_PIN,   gpioModePushPull, 1); // CS idle high
   GPIO_PinModeSet(LITE_RFID_MISO_PORT, LITE_RFID_MISO_PIN, gpioModeInput,    0);
+#ifdef LITE_RFID_HAS_ENABLE
+  GPIO_PinModeSet(LITE_RFID_ENABLE_PORT, LITE_RFID_ENABLE_PIN, gpioModePushPull, 1); // enable HIGH = run
+  delay(20);   // let the CLRC663 power up before softReset / VERSION read
+#endif
 #ifdef LITE_RFID_HAS_PDOWN
   GPIO_PinModeSet(LITE_RFID_PDOWN_PORT, LITE_RFID_PDOWN_PIN, gpioModePushPull, 0); // PDOWN low = run
 #endif
@@ -104,7 +108,10 @@ void LiteRfid::loop()
   _wasVehicle = vehicle;
 
 #ifdef LITE_RFID_PINS_CONFIRMED
-  if (!_cfg.enabled || !g_lite_rfid_status.reader_ok) return;
+  // Poll when RFID is enabled OR an enroll/scan window is open (so the UI "scan" button can
+  // read a UID without RFID gating being on).
+  bool scanning = ((int32_t)(_scanUntilMs - millis()) > 0);
+  if ((!_cfg.enabled && !scanning) || !g_lite_rfid_status.reader_ok) return;
 
   uint32_t now = millis();
   if (now - _lastPollMs < LITE_RFID_POLL_INTERVAL_MS) return;
@@ -121,17 +128,36 @@ void LiteRfid::loop()
     g_lite_rfid_status.last_uid[sizeof(g_lite_rfid_status.last_uid) - 1] = '\0';
     g_lite_rfid_status.last_allowed = allowed;
     g_lite_rfid_status.last_scan_ms = now;
+    if (scanning) {
+      _scanUntilMs = 0;   // got a tag -> close the window
+      lite_console_debugf("rfid: scanned %s (%s)", hex, allowed ? "in list" : "not in list");
+    }
   }
 
-  LiteRfidDecideIn in{ _cfg.enabled, present, allowed, g_lite_rfid_status.authorized };
-  switch (lite_rfid_decide(in)) {
-    case LiteRfidAction::Authorize: onAuthorized(hex); break;
-    case LiteRfidAction::Deny:
-      lite_console_debugf("rfid: denied %s (not in allow-list)", hex);
-      break;
-    case LiteRfidAction::None: default: break;
+  // Charge-gating only applies when RFID is enabled; a bare scan window never gates.
+  if (_cfg.enabled) {
+    LiteRfidDecideIn in{ _cfg.enabled, present, allowed, g_lite_rfid_status.authorized };
+    switch (lite_rfid_decide(in)) {
+      case LiteRfidAction::Authorize: onAuthorized(hex); break;
+      case LiteRfidAction::Deny:
+        lite_console_debugf("rfid: denied %s (not in allow-list)", hex);
+        break;
+      case LiteRfidAction::None: default: break;
+    }
   }
 #endif // LITE_RFID_PINS_CONFIRMED
+}
+
+void LiteRfid::startScan(uint32_t window_ms)
+{
+  _scanUntilMs = millis() + window_ms;
+  if (_scanUntilMs == 0) _scanUntilMs = 1;   // avoid the "idle" sentinel
+}
+
+uint32_t LiteRfid::scanSecondsLeft() const
+{
+  int32_t d = (int32_t)(_scanUntilMs - millis());
+  return d > 0 ? (uint32_t)((d + 999) / 1000) : 0;
 }
 
 void LiteRfid::reconfigure(const LiteRfidConfig &cfg)

@@ -91,4 +91,8 @@ struct LiteRfidConfig {
 };
 bool lite_config_load_rfid(LiteRfidConfig &out);  // fills defaults; true if any key present
 bool lite_config_save_rfid(const LiteRfidConfig &in);
+
+// RFID UID->name map (Labs "users" feature), persisted as a JSON-object string.
+bool lite_config_load_rfid_users(String &out);   // out="" if unset; true if present
+bool lite_config_save_rfid_users(const String &in);
 #endif
