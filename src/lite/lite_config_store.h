@@ -109,4 +109,9 @@ bool lite_config_save_temp_throttle(const LiteTempThrottleConfig &in);
 // runtime limit itself is volatile (set via POST /limit); only the boot default persists.
 bool lite_config_load_limit_default(String &type_out, int &value_out); // false if unset
 bool lite_config_save_limit_default(const String &type, int value);
+
+// Event-log ring snapshot (raw blob, persisted on the session-complete edge so completed-
+// session history survives a reboot). Caller sizes the buffer to the max possible blob.
+bool lite_config_load_eventlog(void *buf, size_t cap, size_t &out_len); // false if unset; out_len = bytes read
+bool lite_config_save_eventlog(const void *buf, size_t len);
 #endif

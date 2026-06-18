@@ -354,4 +354,24 @@ bool lite_config_save_limit_default(const String &type, int value)
   ok = kv_set_int("limit_default_value", value) && ok;
   return ok;
 }
+
+// --- Event-log ring snapshot ---
+
+bool lite_config_load_eventlog(void *buf, size_t cap, size_t &out_len)
+{
+  out_len = 0;
+  if (!s_ready) return false;
+  struct fdb_blob blob;
+  fdb_kv_get_blob(&s_kvdb, "evtlog", fdb_blob_make(&blob, buf, cap));
+  if (blob.saved.len == 0) return false;            // key absent
+  out_len = blob.saved.len < cap ? blob.saved.len : cap;
+  return true;
+}
+
+bool lite_config_save_eventlog(const void *buf, size_t len)
+{
+  if (!s_ready) return false;
+  struct fdb_blob blob;
+  return fdb_kv_set_blob(&s_kvdb, "evtlog", fdb_blob_make(&blob, (void *)buf, len)) == FDB_NO_ERR;
+}
 #endif

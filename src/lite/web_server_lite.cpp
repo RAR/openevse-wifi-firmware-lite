@@ -26,6 +26,7 @@
 #include "lite_shaper.h"
 #include "lite_temp_throttle.h"
 #include "lite_limit.h"
+#include "lite_event_log.h"
 #include "lite_provision.h"
 #include "lite_console.h"
 #include "web_ui_lite.h"
@@ -131,6 +132,13 @@ static String         s_rfidUsers = "{}";   // Labs UID->name map (JSON object s
 
 // Pushed sensor feed (3c POST /status). Read by the divert/shaper glue below.
 static LiteFeed s_feed;
+
+// Event log (/logs): RAM ring of EVSE state-change snapshots. Logged on each resolved
+// state change (loop edge-detect), persisted to kvs on the session-complete edge so
+// completed-session history survives reboot. Served via /logs + /logs/<index>.
+static LiteEventLog s_evlog;
+static int          s_evLogLastState   = -999;   // last OpenEVSE state code logged
+static bool         s_evLogWasCharging = false;  // charge->idle edge -> persist
 
 // ---- /override (Slice 3b) volatile state (not persisted; resets on reboot) -------------
 static LiteOverrideLimits s_ovrLimits;            // limits of the active override
@@ -348,6 +356,71 @@ static void handle_limit() {
     limit_get_json(body);   // GET
   }
   s_server.send(code, "application/json", body);
+}
+
+// ---- /logs (event log) ---------------------------------------------------------------
+static const char *evlog_type_str(uint8_t t) {
+  return t == (uint8_t)LiteEventType::Warning      ? "warning"      :
+         t == (uint8_t)LiteEventType::Notification ? "notification" : "information";
+}
+static const char *evlog_mgr_str(uint8_t s) {
+  return s == (uint8_t)EvseState::Active   ? "active"   :
+         s == (uint8_t)EvseState::Disabled ? "disabled" : "none";
+}
+
+// Snapshot the live manager + feeds into the ring. Caller ensures the clock is valid.
+static void evlog_capture(int evseState) {
+  LiteEventLogEntry e;
+  memset(&e, 0, sizeof(e));
+  e.epoch        = s_clock->nowUtc(millis());
+  e.type         = (uint8_t)((evseState >= 4 && evseState <= 11) ? LiteEventType::Warning
+                                                                 : LiteEventType::Information);
+  e.managerState = (uint8_t)s_mgr_ctrl->getState();
+  e.evseState    = (uint8_t)evseState;
+  e.evseFlags    = 0;                              // lite has no flag word
+  e.pilotA       = (uint16_t)s_mgr_ctrl->getChargeCurrent();
+  e.energyWh     = s_mgr_ctrl->getSessionWattHours();
+  e.elapsedS     = s_mgr_ctrl->getSessionElapsed();
+  e.tempC        = s_mgr_ctrl->isTemperatureValid() ? (int16_t)s_mgr_ctrl->getTemperature() : INT16_MIN;
+  e.divertMode   = s_divertCfg.enabled ? 2 : 1;
+  e.shaper       = s_shaperCfg.enabled ? 1 : 0;
+  e.soc          = s_feed.veh_soc_valid ? (int8_t)s_feed.veh_soc : -1;
+  if (g_lite_rfid_status.last_uid[0]) {
+    strncpy(e.rfid, g_lite_rfid_status.last_uid, sizeof(e.rfid) - 1);
+    e.rfid[sizeof(e.rfid) - 1] = '\0';
+  }
+  s_evlog.push(e);
+}
+
+static void handle_logs() {
+  // Capability probe + page-index range. Single RAM block -> {min:0,max:0}.
+  s_server.send(200, "application/json", "{\"min\":0,\"max\":0}");
+}
+
+static void handle_logs_block() {
+  if (s_server.pathArg(0).toInt() != 0) { s_server.send(200, "application/json", "[]"); return; }
+  String out; out.reserve(64 + s_evlog.count() * 224);
+  out = "[";
+  char tbuf[24], line[320];
+  for (size_t i = 0; i < s_evlog.count(); i++) {
+    const LiteEventLogEntry &e = s_evlog.at(i);
+    lite_clock_iso8601(e.epoch, tbuf, sizeof(tbuf));
+    int t = (e.tempC == INT16_MIN) ? 0 : (int)e.tempC;
+    snprintf(line, sizeof(line),
+      "%s{\"time\":\"%s\",\"type\":\"%s\",\"managerState\":\"%s\",\"evseState\":%u,"
+      "\"evseFlags\":%lu,\"pilot\":%u,\"energy\":%lu,\"elapsed\":%lu,"
+      "\"temperature\":%d,\"temperatureMax\":%d,\"divertMode\":%u,\"shaper\":%u",
+      i ? "," : "", tbuf, evlog_type_str(e.type), evlog_mgr_str(e.managerState),
+      (unsigned)e.evseState, (unsigned long)e.evseFlags, (unsigned)e.pilotA,
+      (unsigned long)e.energyWh, (unsigned long)e.elapsedS, t, t,
+      (unsigned)e.divertMode, (unsigned)e.shaper);
+    out += line;
+    if (e.rfid[0]) { out += ",\"rfidTag\":\""; out += e.rfid; out += "\""; }
+    if (e.soc >= 0) { out += ",\"soc\":"; out += (int)e.soc; }
+    out += "}";
+  }
+  out += "]";
+  s_server.send(200, "application/json", out);
 }
 
 static void handle_override() {
@@ -1113,6 +1186,11 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
     if (lite_config_load_limit_default(lt, lv) && lv > 0) {
       LiteLimitType t = lite_limit_type_from_string(lt.c_str());
       if (t != LiteLimitType::None) { s_limit = { t, (uint32_t)lv, false }; } } }
+
+  // Restore the persisted event-log ring (completed-session history across reboots).
+  { static uint8_t evblob[2 + LITE_EVENTLOG_CAPACITY * sizeof(LiteEventLogEntry)];
+    size_t evlen = 0;
+    if (lite_config_load_eventlog(evblob, sizeof(evblob), evlen)) s_evlog.fromBlob(evblob, evlen); }
   lite_config_load_wizard(s_wizardPassed); // keeps default false if never set (shows wizard)
 
   lite_config_load_mqtt(s_mqttCfg);       // fills defaults if absent (disabled by default)
@@ -1127,6 +1205,8 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
   s_server.on("/config", handle_config);
   s_server.on("/override", handle_override);
   s_server.on("/limit", handle_limit);
+  s_server.on("/logs", handle_logs);
+  s_server.on(UriBraces("/logs/{}"), HTTP_GET, handle_logs_block);
   s_server.on("/schedule", handle_schedule);
   s_server.on(UriBraces("/schedule/{}"), HTTP_DELETE, handle_schedule_del_path);
   s_server.on("/scan", handle_scan);
@@ -1407,6 +1487,25 @@ void web_server_lite_loop()
     } else if (s_mgr_ctrl->clientHasClaim(EvseClient_OpenEVSE_Limit)) {
       s_mgr_ctrl->release(EvseClient_OpenEVSE_Limit);
     }
+  }
+
+  // Event log: record each resolved EVSE-state change (loop edge-detect; a valid clock is
+  // needed for the timestamp, so pre-NTP states aren't logged until sync). Persist the ring
+  // to kvs on the session-complete (charge->idle) edge so completed history survives reboot.
+  if (s_mgr_ctrl) {
+    bool charging = s_mgr_ctrl->isCharging();
+    int evState = openevse_state_code(s_mgr_ctrl->getDeviceState(),
+                                      s_mgr_ctrl->getState() == EvseState::Disabled);
+    if (evState != s_evLogLastState && s_clock && s_clock->valid()) {
+      evlog_capture(evState);
+      s_evLogLastState = evState;
+    }
+    if (s_evLogWasCharging && !charging) {
+      static uint8_t evblob[2 + LITE_EVENTLOG_CAPACITY * sizeof(LiteEventLogEntry)];
+      size_t n = s_evlog.toBlob(evblob, sizeof(evblob));
+      if (n) lite_config_save_eventlog(evblob, n);
+    }
+    s_evLogWasCharging = charging;
   }
 
   // MQTT telemetry: per-field publish on cadence (faster while charging). No-op when
