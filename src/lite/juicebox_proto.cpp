@@ -126,6 +126,7 @@ int juicebox_fault_openevse_state(int wrCode) {
     case 102: return 8;   // Relay Stuck Open         -> stuck relay
     case 4:   return 5;   // Short Circuit Pilot      -> diode check (nearest pilot fault)
     case 5:   return 5;   // Pilot Signal Gen Fail    -> diode check (nearest pilot fault)
+    case 105: return 4;   // Vehicle vent req         -> vent required (J1772 state D); HW-confirmed 2026-06-20
     case 1:   return 9;   // FW Self Tests Failed     -> GFCI self-test (nearest "self test")
     default:  return 8;   // unknown fault            -> generic fault slot
   }

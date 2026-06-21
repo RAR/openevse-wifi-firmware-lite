@@ -51,6 +51,7 @@ TEST_CASE("juicebox_fault_openevse_state maps faults to the closest OpenEVSE cod
   CHECK(juicebox_fault_openevse_state(102) == 8);  // Relay Stuck Open -> stuck relay
   CHECK(juicebox_fault_openevse_state(5)   == 5);  // Pilot Signal Gen Fail -> diode (nearest, NOT relay)
   CHECK(juicebox_fault_openevse_state(4)   == 5);  // Short Circuit Pilot -> diode (nearest)
+  CHECK(juicebox_fault_openevse_state(105) == 4);  // Vehicle vent req -> vent required (HW-confirmed)
   CHECK(juicebox_fault_openevse_state(1)   == 9);  // FW Self Tests Failed -> self-test
   CHECK(juicebox_fault_openevse_state(999) == 8);  // unknown -> generic fault slot
 }

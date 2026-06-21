@@ -209,10 +209,34 @@ the `S00`-at-idle example frame — **verify with live capture across plug/charg
 Treat the exact 0–5 ↔ semantic mapping as **LIKELY** until a live capture confirms which integer appears
 at unplugged / plugged-idle / charging / GFI.
 
-### F — fault code — **CONFIRMED (literal strings in the image)**
+**HW-confirmed 2026-06-20** (live boot→states trace, `docs/captures/2026-06-20-stock-boot-states.log`,
+JuiceBox 2.01 US, FW 200118): the wire `S` field is **hex and exceeds 0..5** — the trace carried
+`S00 S01 S02 S05 S11`. The static `cpi 0x06` bound is an *internal* consumer, not the `$ES` wire value.
+The corrected, HW-confirmed map (matches the `JB_S_*` enum in `juicebox_proto.h`):
 
-The F field carries the fault code; the full code table is present verbatim in flash as ASCII
-`"NNN:text"` strings (offsets shown):
+| S (hex) | meaning (CONFIRMED) | seen live |
+|---------|---------------------|-----------|
+| 0x00 | INIT — init/reset, contactor open | ✓ (boot) |
+| 0x01 | READY — pilot setup (steady idle) | ✓ (most common) |
+| 0x02 | STANDBY — standby poll | ✓ |
+| 0x05 | FAULT — contactor open; detail in `$WR`/`$MD` | ✓ (after vent-req) |
+| 0x11 | IDLE — idle/connected poll (hub state) | ✓ |
+| 0x21 | PRECHARGE — contactor opening toward charge | ✗ (no current drawn) |
+| 0x31 | CHARGING — contactor closed | ✗ (no current drawn) |
+
+0x21/0x31 stay inferred: the bench EVSE tester pulls no current, so no real C state was reached.
+This supersedes the "decimal 0..5" table above.
+
+### F — fault code — **CORRECTED: the `$ES` `F` field is NOT the fault code (it is the offline-limit echo)**
+
+> **HW-correction 2026-06-20:** in the live trace the `$ES` `F` field stayed `F40` *through* a real
+> `$WR015:105:Vehicle vent req` fault (which drove `S05`). So `F` does **not** carry the active fault —
+> faults arrive as standalone `$WR<len>:<code>:<text>` frames (§3). `juicebox_proto.h` already reclassifies
+> this field as `offline_limit` (the RAM 0x520 fallback-current echo), not a fault/frequency field.
+
+The fault **code table** below is still valid — it is the verbatim `"NNN:text"` string set in flash, and it
+is the payload of the `$WR` frames. Two codes are now HW-confirmed (exact on-wire labels matched the table):
+`$WR018:004:Short Circuit Pilot` and `$WR015:105:Vehicle vent req` (`docs/captures/2026-06-20-…`):
 
 Active faults:
 | code | text (flash offset) |
@@ -220,7 +244,7 @@ Active faults:
 | 001 | FW Self Tests Failed (945) |
 | 002 | Non-VM Error (970) |
 | 003 | No GND (987) |
-| 004 | Short Circuit Pilot (998) |
+| 004 | Short Circuit Pilot (998) — **live ✓ 2026-06-20** |
 | 005 | Pilot Signal Gen Fail (1022) |
 | 006 | GFI Auto Test Fail (1048) |
 | 007 | Relay Stuck Closed (1071) |
@@ -229,7 +253,7 @@ Active faults:
 | 102 | Relay Stuck Open (1144) |
 | 103 | Diode Check Fail (1165) |
 | 104 | Overheated (1186) |
-| 105 | Vehicle vent req (1201) |
+| 105 | Vehicle vent req (1201) — **live ✓ 2026-06-20**; maps to OpenEVSE state 4 (vent required) |
 | 106 | HostEVSE Error (1222) |
 | 107 | Lock Fail Error (1241) |
 

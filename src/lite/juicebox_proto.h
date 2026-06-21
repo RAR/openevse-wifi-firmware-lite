@@ -85,7 +85,9 @@ int juicebox_wr_code(const char *wr);
 //   001 FW Self Tests Failed   003 No GND              004 Short Circuit Pilot
 //   005 Pilot Signal Gen Fail  006 GFI Auto Test Fail  007 Relay Stuck Closed
 //   008 Ground Fault Int Lockout  101 Ground Fault Int  102 Relay Stuck Open
-// OpenEVSE codes: 5 diode, 6 GFCI fault, 7 no-ground, 8 stuck-relay, 9 GFCI self-test.
+//   105 Vehicle vent req (J1772 state D)
+// 004 + 105 labels HW-confirmed against the stock unit 2026-06-20 (docs/captures/).
+// OpenEVSE codes: 4 vent required, 5 diode, 6 GFCI fault, 7 no-ground, 8 stuck-relay, 9 GFCI self-test.
 // Pilot faults (004/005) have no OpenEVSE equivalent -> nearest pilot-domain code
 // (5 diode); the EXACT text always rides the `wr` field for the UI to render.
 // Unknown codes -> 8 (generic fault slot). Pure (native-tested).
