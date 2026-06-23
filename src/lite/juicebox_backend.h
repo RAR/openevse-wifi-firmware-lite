@@ -26,9 +26,9 @@ public:
   void setChargeCurrent(int amps) override { _chargeLimit = amps; _cmdDirty = true; }
   // Distinct from getAmps() (the Atmel's reported max/rating in $ES field A).
   int  getChargeCurrent() const override { return _chargeLimit; }
-  // Disabled => stop via the ~LK lock gate (01=lock/stop, 00=unlock/enable) — the real
-  // start/stop control confirmed on the wire 2026-06-17, sent by sendSetpoints(). Marks the
-  // command dirty so loop() pushes the lock change immediately.
+  // Disabled => charge stop. The actual stop is ~AL000 (0 A pilot) in sendSetpoints(), NOT
+  // ~LK: HW 2026-06-23 showed a vehicle already in J1772 State C ignores ~LK01 and keeps
+  // drawing. Marks the command dirty so loop() pushes the 0 A setpoint immediately.
   void setState(EvseState s) override { _enabled = (s != EvseState::Disabled); _cmdDirty = true; }
   bool isCharging() const override { return juicebox_map_state(_status.state) == LiteEvseState::Charging; }
   int  getMinCurrent() const override { return 6; }
@@ -73,7 +73,7 @@ private:
   // Charge-current limit (A) advertised by the keepalive. Safe 6 A J1772 floor by default;
   // a future control feature will make this settable. NEVER auto-track the MCU's reported max.
   int            _chargeLimit    = 6;
-  bool _enabled = true;    // Slice 1.5: Disabled => advertise the 6 A floor (no true stop cmd; see setState)
+  bool _enabled = true;    // false => sendSetpoints() commands 0 A = true charge stop (HW 2026-06-23)
   int  _maxHwCurrent = 48; // service-max rating; seeded by the manager from config
   char _hw[24] = {0};
   char _fw[16] = {0};

@@ -235,11 +235,17 @@ void JuiceBoxBackend::sendFrame(const char *type, const char *payload) {
   }
 }
 
-// Push the active setpoint to the MCU: ~AL (active current limit, the J1772 charge gate),
-// ~OL (offline/fallback limit, mirrored), ~LK (lock: 00=enable/charge, 01=stop). Driven by
-// the EVSE manager via setChargeCurrent()/setState(); amps clamped to [0,79] in the builder.
+// Push the active setpoint to the MCU: ~AL (active current limit = the J1772 charge gate),
+// ~OL (offline/fallback limit, mirrored), ~LK (connector lock). Driven by the EVSE manager
+// via setChargeCurrent()/setState(); amps clamped to [0,79] in the builder.
+//
+// CHARGE STOP = ~AL000 (collapse the advertised pilot current), NOT ~LK. HW 2026-06-23:
+// a vehicle already in J1772 State C ignores ~LK01 and keeps drawing, so on Disabled
+// (manual Off / a tripped limit) we command 0 A and the pilot drops -> the car stops. ~OL
+// is mirrored to 0 too so a comms-loss while disabled also stays stopped (fail-safe). ~LK
+// is still asserted (it's the physical connector lock, harmless either way).
 void JuiceBoxBackend::sendSetpoints() {
-  int amps = _chargeLimit < 0 ? 0 : _chargeLimit;
+  int amps = (!_enabled || _chargeLimit < 0) ? 0 : _chargeLimit;
   char buf[48];
   // Each builder writes a frame; fold in the LF, send, and mirror to /evse/console.
   auto emit = [this, &buf](bool built) {
@@ -253,7 +259,7 @@ void JuiceBoxBackend::sendSetpoints() {
   emit(juicebox_build_offline_limit(amps, buf, sizeof(buf)));
   emit(juicebox_build_lock(!_enabled, buf, sizeof(buf)));
 #ifdef JB_DEBUG
-  LT_I("JBTX(~): ~AL/~OL=%d ~LK=%s", amps, _enabled ? "00(enable)" : "01(stop)");
+  LT_I("JBTX(~): ~AL/~OL=%d ~LK=%s", amps, _enabled ? "00(unlock)" : "01(lock)");
 #endif
 }
 
