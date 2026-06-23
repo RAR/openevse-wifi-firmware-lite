@@ -55,6 +55,49 @@ ManualOverride manual(s_manager);
 static bool     s_apCredsFailed = false;  // D3: only retry STA if creds existed-but-failed
 static uint32_t s_apSinceMs     = 0;      // millis() when the current AP window began
 
+#if defined(LITE_LED_SELFTEST) && defined(LED_R) && defined(LED_G) && defined(LED_B)
+// Gated bench validation of the LibreTiny analogWrite() PWM primitive (NOT in release
+// builds). Runs once at the end of setup(), then loop() drives the normal indicator.
+// Sequence mirrors the libretiny PWM bench checklist so the result maps 1:1 to it:
+//   1 routing    — ramp R, then G, then B alone 0->255 (others off): each must ramp
+//                  smoothly and be the correct physical color (wrong color = bad LOC/timer).
+//   2 run-update — on red, 64 then 200 via analogWrite: the buffered-update path (no host
+//                  test); brightness must step cleanly, no glitch.
+//   3 handoff    — digitalWrite(LED_R, LOW) after analogWrite must fully extinguish, then
+//                  analogWrite re-arms it (proves PWM route releases + re-inits).
+//   5 color mix  — true orange (255/70/0), white, purple held for eyeballing the hue.
+// (4 no-flicker is observable throughout.) analogWriteFrequency(300) is set by the caller.
+static void lite_led_selftest()
+{
+  const int led[3] = { LED_R, LED_G, LED_B };
+  // Repeat the whole sweep a few times so the bench has a comfortable window to watch and
+  // re-confirm each phase (it runs once per boot; this avoids a "missed it" reflash).
+  for (int rep = 0; rep < 3; rep++) {
+    // 1. Per-channel routing ramp.
+    for (int ch = 0; ch < 3; ch++) {
+      analogWrite(led[0], 0); analogWrite(led[1], 0); analogWrite(led[2], 0);
+      for (int v = 0; v <= 255; v += 5) { analogWrite(led[ch], v); delay(15); }
+      delay(500);
+      analogWrite(led[ch], 0);
+      delay(300);
+    }
+    // 2. Running buffered update on red.
+    analogWrite(LED_R, 64);  delay(900);
+    analogWrite(LED_R, 200); delay(900);
+    // 3. GPIO handoff then PWM re-arm.
+    digitalWrite(LED_R, LOW); delay(900);
+    analogWrite(LED_R, 255);  delay(500);
+    analogWrite(LED_R, 0);    delay(300);
+    // 5. Color mixes — hold each for a clear eyeball read.
+    analogWrite(LED_R, 255); analogWrite(LED_G, 70);  analogWrite(LED_B, 0);   delay(1800); // orange
+    analogWrite(LED_R, 255); analogWrite(LED_G, 255); analogWrite(LED_B, 255); delay(1800); // white
+    analogWrite(LED_R, 255); analogWrite(LED_G, 0);   analogWrite(LED_B, 255); delay(1800); // purple
+    analogWrite(LED_R, 0); analogWrite(LED_G, 0); analogWrite(LED_B, 0);
+    delay(600);
+  }
+}
+#endif
+
 void setup()
 {
 #ifdef LITE_RFID_SCAN
@@ -134,13 +177,25 @@ void setup()
   GPIO_PinOutSet(gpioPortF, 11);    // release RESET — Atmel boots fresh
   delay(100);                       // brief settle; loop() catches the boot frames
 
-  // Take ownership of the RGB LED from the WiFi backend and show EVSE state instead of
-  // the WiFi bring-up ladder. ltWifiStatusLedEnable(false) makes the WiFi LED calls no-op.
+  // Take ownership of the RGB LED from the WiFi backend and show EVSE state instead of the
+  // WiFi bring-up ladder. The ladder is already off at compile time (build flag
+  // LT_WIFI_STATUS_LED_DEFAULT=0), so it never touched the LED even during connect; this
+  // runtime disable is belt-and-suspenders for any build without that flag.
 #if defined(LED_R) && defined(LED_G) && defined(LED_B)
   ltWifiStatusLedEnable(false);
-  pinMode(LED_R, OUTPUT);
-  pinMode(LED_G, OUTPUT);
-  pinMode(LED_B, OUTPUT);
+  // Own all three RGB pins via PWM from here on. analogWriteFrequency() sets a single
+  // GLOBAL period that a channel only latches when it is (re)written — so set 300 Hz
+  // (flicker-free) BEFORE the first analogWrite, then seed all three to off so they
+  // init at 300 Hz. Never pinMode/digitalWrite these pins again: that detaches the PWM
+  // route (ltPwmDetach) and the next analogWrite re-inits it — thrashing every frame.
+  analogWriteFrequency(300);
+  analogWrite(LED_R, 0);
+  analogWrite(LED_G, 0);
+  analogWrite(LED_B, 0);
+#endif
+
+#if defined(LITE_LED_SELFTEST) && defined(LED_R) && defined(LED_G) && defined(LED_B)
+  lite_led_selftest();   // gated PWM bench sweep; loop() then drives the normal indicator
 #endif
 }
 
@@ -189,17 +244,21 @@ void loop()
   }
   s_wasCharging = charging;
 
-  // EVSE-state RGB indicator (active-high). Pure mapping in lite_led; this is the only
+  // OEM-style RGB indicator (active-high PWM). Pure mapping in lite_led; this is the only
   // device-side glue. Compiled out on boards without the LED_R/G/B variant macros.
 #if defined(LED_R) && defined(LED_G) && defined(LED_B)
   {
     LiteLedSpec spec = lite_led_for(s_manager.getDeviceState(),
                                     s_manager.getState() == EvseState::Disabled,
-                                    s_backend.isOnline());
-    bool on = lite_led_phase_on(spec.pattern, millis());
-    digitalWrite(LED_R, (spec.color.r && on) ? HIGH : LOW);
-    digitalWrite(LED_G, (spec.color.g && on) ? HIGH : LOW);
-    digitalWrite(LED_B, (spec.color.b && on) ? HIGH : LOW);
+                                    s_backend.isOnline(),
+                                    web_server_lite_in_ap_mode(),
+                                    WiFi.status() == WL_CONNECTED);
+    uint8_t env = lite_led_envelope(spec.pattern, millis());
+    // Drive every channel through analogWrite (incl. full 0/255) — mixing a digitalWrite
+    // here would detach the PWM route (see setup()). Duty = color * envelope, both 0..255.
+    analogWrite(LED_R, (spec.color.r * env) / 255);
+    analogWrite(LED_G, (spec.color.g * env) / 255);
+    analogWrite(LED_B, (spec.color.b * env) / 255);
   }
 #endif
 }
