@@ -17,6 +17,10 @@ struct LiteLedSpec { LiteLedColor color; LiteLedPattern pattern; };
 // the host tests share the exact period.
 static constexpr uint32_t LITE_LED_BREATHE_MS = 2600;
 
+// Blink half-periods (ms): time lit, then time dark — full cycle is 2x. Exposed for tests.
+static constexpr uint32_t LITE_LED_SLOWBLINK_MS = 1000;  // ~0.5 Hz, calm "ready/idle/suspended"
+static constexpr uint32_t LITE_LED_FASTBLINK_MS = 160;   // ~3 Hz, urgent error
+
 // Resolve the indicator, mimicking the OEM JuiceBox LED guide
 // (effortlesselectric.com/docs/juicebox-led-indicator). Priority (first match wins):
 //   powering-on (no controller comms) > setup (softAP) > error > suspended/standby

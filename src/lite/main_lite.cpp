@@ -98,6 +98,22 @@ static void lite_led_selftest()
 }
 #endif
 
+#if defined(LED_R) && defined(LED_G) && defined(LED_B)
+// Drive the "powering on" orange breathe (the commsOnline=false indicator) at nowMs.
+// Called from setup() — before loop() runs — so the LED breathes from the first moment
+// instead of sitting dark until the app takes the LED at the end of setup(). Uses the same
+// lite_led_for/envelope path as loop(), so the handoff into loop() is seamless.
+// analogWriteFrequency(300) must already be set (see setup()).
+static void lite_led_boot_breathe(uint32_t nowMs)
+{
+  LiteLedSpec spec = lite_led_for(LiteEvseState::Unknown, false, /*commsOnline=*/false, false, false);
+  uint8_t env = lite_led_envelope(spec.pattern, nowMs);
+  analogWrite(LED_R, (spec.color.r * env) / 255);
+  analogWrite(LED_G, (spec.color.g * env) / 255);
+  analogWrite(LED_B, (spec.color.b * env) / 255);
+}
+#endif
+
 void setup()
 {
 #ifdef LITE_RFID_SCAN
@@ -131,6 +147,18 @@ void setup()
   // one real post-OTA metadata write happens with the radio idle (no WiFi-link blip).
   lt_ota_confirm();
 
+  // Light the RGB LED immediately (orange "powering on" breathe) so there's no dark gap
+  // while WiFi connects below. The WiFi-LED ladder is already off (LT_WIFI_STATUS_LED_DEFAULT=0);
+  // this hands the pins to our PWM driver before the (possibly multi-second) connect, and the
+  // connect-wait loop ticks the breathe so it animates. analogWriteFrequency() is a single
+  // GLOBAL period a channel latches only when written — set 300 Hz before the first write.
+  // Never pinMode/digitalWrite these pins (detaches the PWM route).
+#if defined(LED_R) && defined(LED_G) && defined(LED_B)
+  ltWifiStatusLedEnable(false);
+  analogWriteFrequency(300);
+  lite_led_boot_breathe(millis());
+#endif
+
   // Stored-only creds (D1). Try them with a bounded connect; on no-creds or a
   // connect that doesn't land within LITE_STA_CONNECT_TIMEOUT_MS, fall to an open
   // softAP at 192.168.4.1 with SSID OpenEVSE-Lite-<shortid> (D2). The wait loop is
@@ -143,7 +171,10 @@ void setup()
     while (lite_provision_decide(true, WiFi.status() == WL_CONNECTED,
                                  start, millis(), LITE_STA_CONNECT_TIMEOUT_MS)
            == LiteProvisionAction::StaWait) {
-      delay(250);
+#if defined(LED_R) && defined(LED_G) && defined(LED_B)
+      lite_led_boot_breathe(millis());   // animate the orange breathe while connecting
+#endif
+      delay(20);
     }
   }
   if (WiFi.status() == WL_CONNECTED) {
@@ -177,22 +208,8 @@ void setup()
   GPIO_PinOutSet(gpioPortF, 11);    // release RESET — Atmel boots fresh
   delay(100);                       // brief settle; loop() catches the boot frames
 
-  // Take ownership of the RGB LED from the WiFi backend and show EVSE state instead of the
-  // WiFi bring-up ladder. The ladder is already off at compile time (build flag
-  // LT_WIFI_STATUS_LED_DEFAULT=0), so it never touched the LED even during connect; this
-  // runtime disable is belt-and-suspenders for any build without that flag.
-#if defined(LED_R) && defined(LED_G) && defined(LED_B)
-  ltWifiStatusLedEnable(false);
-  // Own all three RGB pins via PWM from here on. analogWriteFrequency() sets a single
-  // GLOBAL period that a channel only latches when it is (re)written — so set 300 Hz
-  // (flicker-free) BEFORE the first analogWrite, then seed all three to off so they
-  // init at 300 Hz. Never pinMode/digitalWrite these pins again: that detaches the PWM
-  // route (ltPwmDetach) and the next analogWrite re-inits it — thrashing every frame.
-  analogWriteFrequency(300);
-  analogWrite(LED_R, 0);
-  analogWrite(LED_G, 0);
-  analogWrite(LED_B, 0);
-#endif
+  // The RGB LED was already handed to our PWM driver at the top of setup() (orange boot
+  // breathe held through WiFi connect); loop() drives the state indicator from here.
 
 #if defined(LITE_LED_SELFTEST) && defined(LED_R) && defined(LED_G) && defined(LED_B)
   lite_led_selftest();   // gated PWM bench sweep; loop() then drives the normal indicator

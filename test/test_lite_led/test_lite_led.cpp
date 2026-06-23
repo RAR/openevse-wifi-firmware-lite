@@ -69,18 +69,20 @@ TEST_CASE("envelope: solid always full on (255)") {
   CHECK(lite_led_envelope(LiteLedPattern::Solid, 1234567) == 255);
 }
 
-TEST_CASE("envelope: slow blink ~1Hz (500ms half), full on/off") {
-  CHECK(lite_led_envelope(LiteLedPattern::SlowBlink, 0)    == 255);  // on
-  CHECK(lite_led_envelope(LiteLedPattern::SlowBlink, 499)  == 255);  // on
-  CHECK(lite_led_envelope(LiteLedPattern::SlowBlink, 500)  == 0);    // off
-  CHECK(lite_led_envelope(LiteLedPattern::SlowBlink, 999)  == 0);    // off
-  CHECK(lite_led_envelope(LiteLedPattern::SlowBlink, 1000) == 255);  // on again
+TEST_CASE("envelope: slow blink (LITE_LED_SLOWBLINK_MS half), full on/off") {
+  const uint32_t H = LITE_LED_SLOWBLINK_MS;
+  CHECK(lite_led_envelope(LiteLedPattern::SlowBlink, 0)         == 255);  // on
+  CHECK(lite_led_envelope(LiteLedPattern::SlowBlink, H - 1)     == 255);  // on
+  CHECK(lite_led_envelope(LiteLedPattern::SlowBlink, H)         == 0);    // off
+  CHECK(lite_led_envelope(LiteLedPattern::SlowBlink, 2 * H - 1) == 0);    // off
+  CHECK(lite_led_envelope(LiteLedPattern::SlowBlink, 2 * H)     == 255);  // on again
 }
 
-TEST_CASE("envelope: fast blink toggles at 160ms") {
-  CHECK(lite_led_envelope(LiteLedPattern::FastBlink, 0)   == 255);
-  CHECK(lite_led_envelope(LiteLedPattern::FastBlink, 160) == 0);
-  CHECK(lite_led_envelope(LiteLedPattern::FastBlink, 320) == 255);
+TEST_CASE("envelope: fast blink toggles at LITE_LED_FASTBLINK_MS") {
+  const uint32_t H = LITE_LED_FASTBLINK_MS;
+  CHECK(lite_led_envelope(LiteLedPattern::FastBlink, 0)       == 255);
+  CHECK(lite_led_envelope(LiteLedPattern::FastBlink, H)       == 0);
+  CHECK(lite_led_envelope(LiteLedPattern::FastBlink, 2 * H)   == 255);
 }
 
 TEST_CASE("envelope: breathe is a gamma-corrected fade (0 at trough, 255 at peak)") {

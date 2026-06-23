@@ -56,8 +56,8 @@ static const uint8_t kBreatheLut[128] = {
 
 uint8_t lite_led_envelope(LiteLedPattern pattern, uint32_t nowMs) {
   switch (pattern) {
-    case LiteLedPattern::SlowBlink: return (((nowMs / 500u) & 1u) == 0u) ? 255 : 0;  // ~1 Hz
-    case LiteLedPattern::FastBlink: return (((nowMs / 160u) & 1u) == 0u) ? 255 : 0;  // ~3 Hz
+    case LiteLedPattern::SlowBlink: return (((nowMs / LITE_LED_SLOWBLINK_MS) & 1u) == 0u) ? 255 : 0;
+    case LiteLedPattern::FastBlink: return (((nowMs / LITE_LED_FASTBLINK_MS) & 1u) == 0u) ? 255 : 0;
     case LiteLedPattern::Breathe: {
       uint32_t n   = sizeof(kBreatheLut) / sizeof(kBreatheLut[0]);  // 128
       uint32_t idx = (nowMs % LITE_LED_BREATHE_MS) * n / LITE_LED_BREATHE_MS;  // 0..n-1
