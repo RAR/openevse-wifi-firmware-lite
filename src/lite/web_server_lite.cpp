@@ -116,6 +116,9 @@ static const uint32_t         LITE_TEMP_THROTTLE_INTERVAL_MS = 30000;
 // default persists. soc/range are inert until vehicle telemetry exists.
 static LiteLimitProps s_limit            = { LiteLimitType::None, 0, true };
 static uint32_t       s_limitVersion     = 0;
+static uint32_t       s_configVersion    = 0;   // bumped on every /config mutation
+static uint32_t       s_claimsVersion    = 0;   // bumped on any claim change (override/limit)
+static uint32_t       s_overrideVersion  = 0;   // bumped on every manual-override change
 static bool           s_limitWasCharging = false;
 static uint32_t       s_limitLastMs      = 0;
 static const uint32_t LITE_LIMIT_INTERVAL_MS = 1000;
@@ -261,6 +264,7 @@ static void override_apply(EvseProperties &props, const LiteOverrideLimits &lim)
   s_ovrExpired  = false;
   s_ovrEnabling = (props.getState() == EvseState::Active);
   manual.claim(props);
+  s_overrideVersion++; s_claimsVersion++;   // UI watches these to re-read /override + /claims/target
 }
 
 static void override_clear() {
@@ -268,6 +272,7 @@ static void override_clear() {
   s_ovrExpired  = false;
   s_ovrEnabling = false;
   manual.release();
+  s_overrideVersion++; s_claimsVersion++;
 }
 
 // Parse a JSON override body into props + limits. False on JSON parse error.
@@ -344,18 +349,86 @@ static void handle_limit() {
     String b = s_server.arg("plain");
     LiteLimitProps p;
     if (limit_parse(b.c_str(), b.length(), p)) {
-      s_limit = p; s_limitVersion++;
-      code = 201; body = "{\"msg\":\"Created\"}";
+      s_limit = p; s_limitVersion++; s_claimsVersion++;
+      // GUI's limit_store.upload treats success as msg=="done" (not "Created"); a mismatch
+      // makes it think the save failed and revert, then the limit_version refetch corrects it.
+      code = 201; body = "{\"msg\":\"done\"}";
     } else { code = 400; body = "{\"msg\":\"Failed to parse JSON\"}"; }
   } else if (s_server.method() == HTTP_DELETE) {
-    s_limit = LiteLimitProps{ LiteLimitType::None, 0, true }; s_limitVersion++;
+    s_limit = LiteLimitProps{ LiteLimitType::None, 0, true }; s_limitVersion++; s_claimsVersion++;
     if (s_mgr_ctrl && s_mgr_ctrl->clientHasClaim(EvseClient_OpenEVSE_Limit))
       s_mgr_ctrl->release(EvseClient_OpenEVSE_Limit);
-    body = "{\"msg\":\"Deleted\"}";
+    body = "{\"msg\":\"done\"}";
   } else {
     limit_get_json(body);   // GET
   }
   s_server.send(code, "application/json", body);
+}
+
+// ---- /claims, /claims/target ---------------------------------------------------------
+// The nightshift Home Off/Auto/On switch derives its position from /claims/target
+// (properties.state + which client owns "state"): manual client 0x00010001 owning
+// "active"/"disabled" => On/Off, anyone else / nobody => Auto. It re-reads only when
+// status.claims_version changes. lite surfaces the manual override here; the internally
+// managed divert/limit/throttle claims show their effect via /status instead.
+static void handle_claims_target() {
+  StaticJsonDocument<256> doc;
+  JsonObject props  = doc.createNestedObject("properties");
+  JsonObject claims = doc.createNestedObject("claims");
+  if (manual.isActive()) {
+    EvseProperties p; manual.getProperties(p);
+    const char *st = override_state_str(p.getState());
+    if (st) { props["state"] = st; claims["state"] = EvseClient_OpenEVSE_Manual; }
+    if (p.hasChargeCurrent()) { props["charge_current"] = p.getChargeCurrent(); claims["charge_current"] = EvseClient_OpenEVSE_Manual; }
+    if (p.hasMaxCurrent())    { props["max_current"]    = p.getMaxCurrent();    claims["max_current"]    = EvseClient_OpenEVSE_Manual; }
+    props["auto_release"] = p.isAutoRelease();
+  } else {
+    props["auto_release"] = true;
+  }
+  String out; serializeJson(doc, out);
+  s_server.send(200, "application/json", out);
+}
+
+static void handle_claims() {
+  StaticJsonDocument<384> doc;
+  JsonArray arr = doc.to<JsonArray>();
+  if (manual.isActive()) {
+    EvseProperties p; manual.getProperties(p);
+    JsonObject o = arr.createNestedObject();
+    o["client"]   = EvseClient_OpenEVSE_Manual;
+    o["priority"] = EvseManager_Priority_Manual;
+    const char *st = override_state_str(p.getState());
+    if (st) o["state"] = st;
+    if (p.hasChargeCurrent()) o["charge_current"] = p.getChargeCurrent();
+    if (p.hasMaxCurrent())    o["max_current"]    = p.getMaxCurrent();
+    o["auto_release"] = p.isAutoRelease();
+  }
+  String out; serializeJson(doc, out);
+  s_server.send(200, "application/json", out);
+}
+
+// GET/POST /divertmode?divertmode=1|2 — the Home Auto/Eco selector. 1 = normal (divert
+// off), 2 = Eco (divert on). lite keeps the divert enable in config; map onto it and bump
+// config_version so the UI re-reads. Mirrors the standard handleDivertMode contract.
+static void handle_divertmode() {
+  String v = s_server.arg("divertmode");
+  if (v.length()) {
+    bool eco = (v.toInt() == 2);
+    if (s_divertCfg.enabled != eco) {
+      s_divertCfg.enabled = eco;
+      lite_config_save_divert(s_divertCfg);
+      s_configVersion++;
+    }
+  }
+  s_server.send(200, "text/plain", "Divert Mode changed");
+}
+
+// GET/POST /restart — reboot the WiFi gateway (the only MCU lite runs on; there is no
+// separate EVSE controller to restart). Deferred so the reply flushes first.
+static void handle_restart() {
+  s_server.send(200, "application/json", "{\"msg\":\"restart gateway\"}");
+  s_rebootPending = true;
+  s_rebootAtMs    = millis() + 750;
 }
 
 // ---- /logs (event log) ---------------------------------------------------------------
@@ -443,6 +516,7 @@ static void handle_override() {
     manual.toggle();
     s_ovrLimits = LiteOverrideLimits(); s_ovrExpired = false;
     EvseProperties tp; s_ovrEnabling = manual.getProperties(tp) && tp.getState() == EvseState::Active;
+    s_overrideVersion++; s_claimsVersion++;
     body = "{\"msg\":\"Updated\"}";
   } else {
     override_get_json(body);   // GET
@@ -561,13 +635,14 @@ void web_server_lite_build_status(JsonDocument &doc)
   doc["uptime"]    = (uint32_t)(millis() / 1000);
   doc["reboot_reason"] = ESPAL.getRebootReason();   // RMU cause of the last reset (latched at boot)
   doc["schedule_version"] = s_scheduleVersion;
-  // Store-version counters the UI watches to refresh on change. lite only tracks schedule;
-  // the rest are 0 (the UI fetches them once at startup and trusts optimistic local updates
-  // on its own writes), present so the UI reads defined values rather than undefined.
-  doc["config_version"]        = 0;
-  doc["claims_version"]        = 0;
-  doc["override_version"]      = 0;
-  doc["schedule_plan_version"] = 0;
+  // Store-version counters the UI watches to lazily re-fetch a store when it changes. All
+  // live now (were hardcoded 0): the Home Off/Auto/On switch in particular re-reads
+  // /claims/target only when claims_version increments. schedule_plan_version tracks the
+  // schedule (the plan is derived from it).
+  doc["config_version"]        = s_configVersion;
+  doc["claims_version"]        = s_claimsVersion;
+  doc["override_version"]      = s_overrideVersion;
+  doc["schedule_plan_version"] = s_scheduleVersion;
   doc["limit_version"]         = s_limitVersion;
   // Subsystem connection states. mqtt is real on lite; the rest are subsystems a JuiceBox
   // lacks -> honest "not connected" defaults so the UI shows status instead of blanks.
@@ -980,6 +1055,8 @@ static void handle_config()
     changed = true;
   }
 
+  if (changed) s_configVersion++;   // UI watches config_version to re-read /config on change
+
   StaticJsonDocument<48> r;
   r["msg"] = changed ? "done" : "no change";
   String resp; serializeJson(r, resp);
@@ -1224,6 +1301,10 @@ void web_server_lite_begin(LiteEvseManager &mgr, LiteClock &clock, LiteEnergyTot
   s_server.on("/config", handle_config);
   s_server.on("/override", handle_override);
   s_server.on("/limit", handle_limit);
+  s_server.on("/claims", HTTP_GET, handle_claims);
+  s_server.on("/claims/target", HTTP_GET, handle_claims_target);
+  s_server.on("/divertmode", handle_divertmode);
+  s_server.on("/restart", handle_restart);
   s_server.on("/logs", handle_logs);
   s_server.on(UriBraces("/logs/{}"), HTTP_GET, handle_logs_block);
   s_server.on("/schedule", handle_schedule);
