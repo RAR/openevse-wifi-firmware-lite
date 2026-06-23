@@ -1,0 +1,22 @@
+// Read-only: dump the EFM32GG11 lock-bits configuration words.
+// Run this on a KNOWN-GOOD JuiceBox WGM (donor) to confirm the working CLW0
+// value, and on our part before/after the fix to verify.
+//
+//   0x0FE041E8 = CLW0  (boot config; working unit should have bit1 = 0)
+//   0x0FE041EC = CLW1
+//   0x0FE041F4 = MLW   (mass-erase lock)
+//   0x0FE041F8 = ULW   (user-page lock)
+//   0x0FE041FC = DLW   (debug lock)  <- if this is not FFFFFFFF the donor is
+//                                       debug-locked; do NOT copy its value.
+//
+// On the donor, the byte at offset 0x1E8 (first word below) is the one that
+// matters: expect 0xFFFFFFFD (bit1 clear). If it differs, use the donor's
+// exact CLW0 value as MSC_WDATA in gg11_fix_clw0_boot.jlink instead of FFFFFFFD.
+si 1
+speed 4000
+device EFM32GG11B820F2048GL192
+connect
+halt
+echo === lock words 0x0FE041E0..0x0FE041FC (CLW0 is the 3rd: @0x1E8) ===
+mem32 0x0FE041E0 8
+exit

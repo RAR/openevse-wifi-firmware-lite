@@ -1,0 +1,56 @@
+// ===========================================================================
+//  EFM32GG11 boot-source fix: clear CLW0[1] so the part boots MAIN FLASH (0x0)
+//  instead of the empty bootloader region (0x0FE10000).
+//
+//  WHY: a virgin/erased GG11 has CLW0 = 0xFFFFFFFF -> bit1 (BOOTLOADER_ENABLE)
+//  is 1 -> after reset the core executes from 0x0FE10000, which is empty (0xFF)
+//  -> UNDEFINSTR -> HardFault loop. Our lite bootloader at 0x0 never runs.
+//  Clearing CLW0[1] (write 0xFFFFFFFD) bypasses the bootloader region and boots
+//  from 0x00000000 = our flashed lite bootloader -> app -> WiFi/AP.
+//
+//  The lite firmware is ALREADY flashed+verified (bootloader@0x0, app@0x8000),
+//  so after this fix a reset should boot straight into it.
+//
+//  Lock-page writes must go through the MSC flash controller (not a plain poke).
+//  All MSC offsets/values verified for EFM32GG11B (MSC base 0x40000000):
+//    MSC_LOCK     0x40000040  key 0x1B71
+//    MSC_WRITECTRL0x40000008  WREN  = 1<<0
+//    MSC_WRITECMD 0x4000000C  LADDRIM=1<<0  WRITEONCE=1<<3
+//    MSC_ADDRB    0x40000010
+//    MSC_WDATA    0x40000018
+//    MSC_STATUS   0x4000001C  BUSY=1<<0
+//    CLW0         0x0FE041E8  (lock-bits page word 122)
+//
+//  RECOVERY: this write is reversible. An AAP DEVICEERASE (JLink "unlock
+//  EFM32Gxxx", or device erase) returns CLW0 to 0xFFFFFFFF; then reflash.
+//  We are NOT touching DLW(0x1FC)/ULW(0x1F8)/MLW(0x1F4) -> debug stays open.
+// ===========================================================================
+si 1
+speed 4000
+device EFM32GG11B820F2048GL192
+connect
+r
+echo === PRE: CLW0 @ 0x0FE041E8 (expect FFFFFFFF) ===
+mem32 0x0FE041E8 1
+// --- MSC unlock + single-word program: CLW0 <- 0xFFFFFFFD ---
+w4 0x40000040, 0x00001B71
+w4 0x40000008, 0x00000001
+w4 0x40000010, 0x0FE041E8
+w4 0x4000000C, 0x00000001
+w4 0x40000018, 0xFFFFFFFD
+w4 0x4000000C, 0x00000008
+sleep 100
+// re-lock MSC, clear write-enable
+w4 0x40000008, 0x00000000
+w4 0x40000040, 0x00000000
+echo === POST: CLW0 @ 0x0FE041E8 (expect FFFFFFFD) ===
+mem32 0x0FE041E8 1
+echo === MSC_STATUS @ 0x4000001C (expect bit0/BUSY clear) ===
+mem32 0x4000001C 1
+echo === reset-halt then read PC: SUCCESS = PC is NOT 0x0FE10000 ===
+echo ===   (should be our bootloader reset vector, ~0x0000072C)        ===
+r
+regs
+echo === releasing core to boot lite firmware ===
+g
+exit
