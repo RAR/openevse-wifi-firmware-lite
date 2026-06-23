@@ -45,6 +45,7 @@ private:
   void sendFrame(const char *type, const char *payload);   // CRC-trailered ~ command/query
   void sendSetpoints();                                     // ~AL current / ~OL fallback / ~LK gate
   void txMirror(const char *s);                             // mirror exact TX bytes to /evse/console
+  void consoleEmit(const char *data, size_t len);           // /evse/console emit, millis()-timestamped
 
   Stream        &_port;
   JuiceBoxParser _parser;

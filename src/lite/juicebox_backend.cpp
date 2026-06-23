@@ -1,6 +1,7 @@
 #if defined(OPENEVSE_LITE) && defined(LITE_EVSE_BACKEND_JUICEBOX)
 #include "juicebox_backend.h"
 #include <string.h>
+#include <stdio.h>       // snprintf for the /evse/console timestamp prefix
 #include "lt_family.h"   // USART0 register access (em_device) — RX-wedge diagnostics
 #include "lite_console.h"   // /evse/console live mirror of the $/~ wire
 
@@ -10,10 +11,10 @@
 extern bool SerialClass_getOverflow();
 
 // Comm-watchdog reload is 3000 ticks; tick period unproven (RE flagged ~3 s LIKELY, up to
-// ~30 s). 15 s keepalive doubles as the empirical probe: if the MCU stays online at this
-// spacing the watchdog is >=15 s; if it flaps offline between beats, it's shorter (tighten
-// back down). Reduce once the timeout is HW-confirmed.
-static const unsigned long JB_KEEPALIVE_INTERVAL_MS = 15000;
+// ~30 s). Tightened 15 s -> 5 s to shrink the window where the MCU could drop to the ~OL
+// offline limit between beats during a session. Still doubles as the watchdog probe: if it
+// flaps offline at 5 s the period is < 5 s (go lower); if it holds, the watchdog is >= 5 s.
+static const unsigned long JB_KEEPALIVE_INTERVAL_MS = 5000;
 // Offline timeout must EXCEED the Atmel's slowest liveness frame. HW-observed
 // 2026-06-13: in steady state the ONLY inbound frame is a $TP ping every ~63 s
 // (metronomic; $ES/$MD only at boot/on-change). A 5 s timeout made isOnline()
@@ -40,8 +41,7 @@ void JuiceBoxBackend::loop() {
     // framing is correct regardless of when a console connects; only the flush is gated.
     if (_rxLineLen < sizeof(_rxLine) - 1) _rxLine[_rxLineLen++] = (char)b;
     if (b == '\n' || _rxLineLen >= sizeof(_rxLine) - 1) {
-      if (lite_console_has_client(LITE_CONSOLE_EVSE))
-        lite_console_broadcast(LITE_CONSOLE_EVSE, (const uint8_t *)_rxLine, _rxLineLen);
+      consoleEmit(_rxLine, _rxLineLen);   // timestamped; no-op when unwatched
       _rxLineLen = 0;
     }
     if (_parser.feed((uint8_t)b, f)) {
@@ -213,10 +213,28 @@ void JuiceBoxBackend::sendKeepalive() {
 }
 
 // Mirror exactly `s` (whatever was written to the UART, terminator included) to the
-// /evse/console live stream. Byte-faithful; a no-op (one cheap check) when unwatched.
+// /evse/console live stream via consoleEmit (which prepends a millis() timestamp).
 void JuiceBoxBackend::txMirror(const char *s) {
-  if (s && *s && lite_console_has_client(LITE_CONSOLE_EVSE))
-    lite_console_broadcast(LITE_CONSOLE_EVSE, (const uint8_t *)s, strlen(s));
+  if (s && *s) consoleEmit(s, strlen(s));
+}
+
+// Emit one line to /evse/console with a "[secs.mmm] " millis() timestamp prefix so the live
+// web console is diagnosable: the delta between a TX command (~AL/~LK) and the $ES that
+// reports the new state localizes where state-change latency lives (car ramp vs MCU vs our
+// readback). Built as ONE WS message (prefix + body) so the timestamp and frame share a
+// console line. No-op (one cheap check) when unwatched. millis() is monotonic — better than
+// wall-clock for sub-second deltas and needs no clock reference here.
+void JuiceBoxBackend::consoleEmit(const char *data, size_t len) {
+  if (!lite_console_has_client(LITE_CONSOLE_EVSE)) return;
+  unsigned long ms = millis();
+  char buf[128];
+  int n = snprintf(buf, sizeof(buf), "[%lu.%03lu] ", ms / 1000UL, ms % 1000UL);
+  if (n < 0) n = 0;
+  size_t off  = (size_t)n > sizeof(buf) ? sizeof(buf) : (size_t)n;
+  size_t room = sizeof(buf) - off;
+  if (len > room) len = room;        // truncate pathological long lines (frames are < ~48 B)
+  memcpy(buf + off, data, len);
+  lite_console_broadcast(LITE_CONSOLE_EVSE, (const uint8_t *)buf, off + len);
 }
 
 // Build a CRC-trailered WiFi->MCU command frame and write it to the UART (LF-terminated,
