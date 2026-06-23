@@ -948,6 +948,25 @@ static void handle_config()
     changed = true;
   }
 
+  // WiFi credentials via the config API. The unified (nightshift) GUI's WiFi
+  // wizard saves through config_store.upload({ssid,pass}) -> POST /config, NOT
+  // the /connect endpoint, so honor ssid/pass here too: persist the creds and
+  // schedule the deferred reboot so the device reconnects on the new network.
+  // (Mirrors handle_connect; pass is optional for open networks.)
+  if (cfg_get(doc, json, "ssid", v) && v.length()) {
+    LiteWifiConfig wc;
+    wc.ssid = v.c_str();
+    String wpass;
+    if (cfg_get(doc, json, "pass", wpass) && wpass.length()) wc.pass = wpass.c_str();
+    if (lite_config_save_wifi(wc)) {
+      changed = true;
+      s_rebootPending = true;
+      s_rebootAtMs    = millis() + 750;   // reboot from loop() after the reply flushes
+    } else {
+      status = 503;   // applied other fields but creds did not persist
+    }
+  }
+
   if (any) {
     cfg.max_current_hard = lite_clamp_service_max(cfg.max_current_hard);
     cfg.max_current_soft = lite_clamp_charge_current(cfg.max_current_soft, cfg.max_current_hard);
