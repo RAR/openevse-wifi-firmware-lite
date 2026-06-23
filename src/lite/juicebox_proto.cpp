@@ -94,12 +94,12 @@ LiteEvseState juicebox_map_state(int raw) {
   // Real faults ride $WR (not S). State D (0x05) maps to Error here; the backend then
   // refines the numeric OpenEVSE state to 4 (vent required) from the co-emitted $WR.
   switch (raw) {
-    case JB_S_B:         return LiteEvseState::Connected;     // J1772 B: plugged, not charging
-    case JB_S_C:                                              // J1772 C: charging
-    case JB_S_PRECHARGE:                                      // legacy charging code (unseen)
-    case JB_S_CHARGING:  return LiteEvseState::Charging;      // legacy charging code (unseen)
+    case JB_S_B:                                             // J1772 B: plugged, not charging
+    case JB_S_PRECHARGE: return LiteEvseState::Connected;    // 0x21: suspended/pre-charge at 0 A (e.g. divert paused)
+    case JB_S_C:                                             // J1772 C: charging
+    case JB_S_CHARGING:  return LiteEvseState::Charging;     // 0x31: charging, current flowing
     case JB_S_D:         return LiteEvseState::Error;         // J1772 D: vent required (-> $WR refines to 4)
-    case JB_S_A:                                              // J1772 A: no vehicle
+    case JB_S_A:                                             // J1772 A: no vehicle
     case JB_S_READY:     return LiteEvseState::NotConnected;  // transitional, no vehicle
     default:             return LiteEvseState::Unknown;
   }

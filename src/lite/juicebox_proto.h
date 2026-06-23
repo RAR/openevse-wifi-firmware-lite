@@ -45,8 +45,8 @@ enum JbStateCode {
   JB_S_C         = 0x02,  // J1772 C: charging                          -> Charging
   JB_S_D         = 0x05,  // J1772 D: charging, ventilation required    -> Error (+$WR -> state 4)
   JB_S_B         = 0x11,  // J1772 B: vehicle connected, not charging   -> Connected
-  JB_S_PRECHARGE = 0x21,  // legacy static-RE code, unseen on HW        -> Charging (defensive)
-  JB_S_CHARGING  = 0x31,  // legacy static-RE code, unseen on HW        -> Charging (defensive)
+  JB_S_PRECHARGE = 0x21,  // J1772 C sub-state: suspended/pre-charge at 0 A  -> Connected (HW 2026-06-23)
+  JB_S_CHARGING  = 0x31,  // J1772 C sub-state: charging, current flowing    -> Charging  (HW 2026-06-23)
 };
 
 // Split a frame body (everything AFTER the leading '$') into type + payload.

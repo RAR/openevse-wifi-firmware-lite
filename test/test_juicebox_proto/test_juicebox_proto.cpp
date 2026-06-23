@@ -124,9 +124,10 @@ TEST_CASE("maps J1772 pilot-state S codes to canonical states (HW-confirmed 2026
   CHECK(juicebox_map_state(JB_S_C) == LiteEvseState::Charging);     // 0x02 J1772 C: charging
   CHECK(juicebox_map_state(JB_S_D) == LiteEvseState::Error);        // 0x05 J1772 D: vent (->$WR state 4)
   CHECK(juicebox_map_state(JB_S_READY) == LiteEvseState::NotConnected); // 0x01 transitional, no vehicle
-  // Legacy static-RE charging codes kept as defensive Charging (unseen on HW).
-  CHECK(juicebox_map_state(JB_S_CHARGING)  == LiteEvseState::Charging);   // 0x31
-  CHECK(juicebox_map_state(JB_S_PRECHARGE) == LiteEvseState::Charging);   // 0x21
+  // J1772 C sub-states seen on the wire 2026-06-23 (stop/start): 0x31 = current flowing
+  // (Charging), 0x21 = suspended/pre-charge at 0 A (Connected, not drawing).
+  CHECK(juicebox_map_state(JB_S_CHARGING)  == LiteEvseState::Charging);   // 0x31 charging
+  CHECK(juicebox_map_state(JB_S_PRECHARGE) == LiteEvseState::Connected);  // 0x21 suspended/precharge 0A
   // Anything else => Unknown.
   CHECK(juicebox_map_state(0x04) == LiteEvseState::Unknown);
   CHECK(juicebox_map_state(0x99) == LiteEvseState::Unknown);
