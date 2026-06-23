@@ -90,18 +90,17 @@ bool juicebox_parse_es(const char *payload, uint16_t len, JuiceBoxStatus &out) {
 }
 
 LiteEvseState juicebox_map_state(int raw) {
-  // Hex state codes per SERIAL_PROTOCOL.md §2a (static decode of this unit's FW).
-  // FIRM: 0x31 charging (contactor closed) + 0x21 pre-charge => Charging; 0x05 => fault.
-  // Idle/poll codes => NotConnected: S cannot distinguish "plugged, idle" from "unplugged"
-  // (the H pilot-voltage field does — promote to Connected in a follow-up).
+  // raw = $ES "S" field = the J1772 pilot state (see JbStateCode; HW-confirmed 2026-06-22).
+  // Real faults ride $WR (not S). State D (0x05) maps to Error here; the backend then
+  // refines the numeric OpenEVSE state to 4 (vent required) from the co-emitted $WR.
   switch (raw) {
-    case JB_S_CHARGING:
-    case JB_S_PRECHARGE: return LiteEvseState::Charging;
-    case JB_S_FAULT:     return LiteEvseState::Error;
-    case JB_S_INIT:
-    case JB_S_READY:
-    case JB_S_STANDBY:
-    case JB_S_IDLE:      return LiteEvseState::NotConnected;
+    case JB_S_B:         return LiteEvseState::Connected;     // J1772 B: plugged, not charging
+    case JB_S_C:                                              // J1772 C: charging
+    case JB_S_PRECHARGE:                                      // legacy charging code (unseen)
+    case JB_S_CHARGING:  return LiteEvseState::Charging;      // legacy charging code (unseen)
+    case JB_S_D:         return LiteEvseState::Error;         // J1772 D: vent required (-> $WR refines to 4)
+    case JB_S_A:                                              // J1772 A: no vehicle
+    case JB_S_READY:     return LiteEvseState::NotConnected;  // transitional, no vehicle
     default:             return LiteEvseState::Unknown;
   }
 }

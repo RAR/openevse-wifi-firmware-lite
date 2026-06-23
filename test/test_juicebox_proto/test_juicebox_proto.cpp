@@ -117,17 +117,17 @@ TEST_CASE("$ES decode rejects empty payload") {
   CHECK_FALSE(juicebox_parse_es("", 0, s));
 }
 
-TEST_CASE("maps hex JB state codes to canonical states (SERIAL_PROTOCOL.md §2a)") {
-  // FIRM: charging + pre-charge => Charging; fault => Error.
+TEST_CASE("maps J1772 pilot-state S codes to canonical states (HW-confirmed 2026-06-22)") {
+  // S field = J1772 pilot state, stepped on a tester: A=0x00 B=0x11 C=0x02 D=0x05.
+  CHECK(juicebox_map_state(JB_S_A) == LiteEvseState::NotConnected); // 0x00 J1772 A: no vehicle
+  CHECK(juicebox_map_state(JB_S_B) == LiteEvseState::Connected);    // 0x11 J1772 B: plugged, idle
+  CHECK(juicebox_map_state(JB_S_C) == LiteEvseState::Charging);     // 0x02 J1772 C: charging
+  CHECK(juicebox_map_state(JB_S_D) == LiteEvseState::Error);        // 0x05 J1772 D: vent (->$WR state 4)
+  CHECK(juicebox_map_state(JB_S_READY) == LiteEvseState::NotConnected); // 0x01 transitional, no vehicle
+  // Legacy static-RE charging codes kept as defensive Charging (unseen on HW).
   CHECK(juicebox_map_state(JB_S_CHARGING)  == LiteEvseState::Charging);   // 0x31
   CHECK(juicebox_map_state(JB_S_PRECHARGE) == LiteEvseState::Charging);   // 0x21
-  CHECK(juicebox_map_state(JB_S_FAULT)     == LiteEvseState::Error);      // 0x05
-  // Idle/poll codes => NotConnected (Connected needs the H field — follow-up).
-  CHECK(juicebox_map_state(JB_S_INIT)    == LiteEvseState::NotConnected); // 0x00
-  CHECK(juicebox_map_state(JB_S_READY)   == LiteEvseState::NotConnected); // 0x01
-  CHECK(juicebox_map_state(JB_S_STANDBY) == LiteEvseState::NotConnected); // 0x02
-  CHECK(juicebox_map_state(JB_S_IDLE)    == LiteEvseState::NotConnected); // 0x11
-  // Anything outside the 7 valid codes => Unknown.
+  // Anything else => Unknown.
   CHECK(juicebox_map_state(0x04) == LiteEvseState::Unknown);
   CHECK(juicebox_map_state(0x99) == LiteEvseState::Unknown);
 }

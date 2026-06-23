@@ -18,30 +18,35 @@ struct JuiceBoxFrame {
 };
 
 // Decoded $ES status fields (raw JB values, pre-normalization).
-// Field semantics per SERIAL_PROTOCOL.md §2a (static decode of THIS unit's FW 100102):
-//   state = "S" state-machine code (HEX on the wire; see JbStateCode)
+// Field semantics (state HW-confirmed 2026-06-22 — supersedes the static §2a decode):
+//   state = "S" — the J1772 CONTROL-PILOT STATE (HEX on the wire; see JbStateCode)
 //   line  = "L" — always 00 / unused
 //   temp  = "T" — echo of the last TP-command value, NOT a temperature sensor
-//   h     = "H" — quantized control-pilot voltage bucket (J1772 connection level)
+//   h     = "H" — meaning UNCONFIRMED; observed pinned at 0x40 across J1772 A/B/C/D,
+//                 so NOT the pilot/connection level (the "S" field carries that)
 //   amps  = "A" — live active current limit (echoes our setpoint)
 //   power = "P" — control-pilot PWM duty, NOT watts
 //   offline_limit = "F" — echo of the offline/fallback current limit (RAM 0x520),
-//                   NOT a fault and NOT frequency. Faults come from S==0x05 + $MD/$WR.
+//                   NOT a fault and NOT frequency. Real faults ride $WR frames.
 struct JuiceBoxStatus {
   bool valid;
   int  state, line, temp, h, amps, power, offline_limit;
 };
 
-// $ES "S" state-machine codes. These are HEX on the wire (e.g. "S31" => 0x31).
-// Per SERIAL_PROTOCOL.md §2a jump-table walk: exactly 7 valid codes.
+// $ES "S" field = the J1772 CONTROL-PILOT STATE (HEX on the wire, e.g. "S11" => 0x11).
+// HW-confirmed 2026-06-22 by stepping an EVSE tester through the J1772 states and
+// reading the reported $ES S code:  A=0x00  B=0x11  C=0x02  D=0x05.  This SUPERSEDES
+// the earlier static-RE "INIT/READY/STANDBY/IDLE/FAULT" decode, which wrongly folded
+// Connected (B) and Charging (C) into NotConnected and treated State D as a hard fault.
+// Real internal faults (GFI, no-GND, stuck relay, diode) ride $WR frames, not "S".
 enum JbStateCode {
-  JB_S_INIT      = 0x00,  // init / reset (contactor open)
-  JB_S_READY     = 0x01,  // ready — pilot setup
-  JB_S_STANDBY   = 0x02,  // standby poll
-  JB_S_FAULT     = 0x05,  // FAULT (forces contactor open) — see $MD/$WR for the code
-  JB_S_IDLE      = 0x11,  // idle / connected poll (hub state)
-  JB_S_PRECHARGE = 0x21,  // pre-charge (contactor opening toward charge)
-  JB_S_CHARGING  = 0x31,  // CHARGING (contactor closed)
+  JB_S_A         = 0x00,  // J1772 A: no vehicle                        -> NotConnected
+  JB_S_READY     = 0x01,  // boot/transitional poll (no vehicle yet)    -> NotConnected
+  JB_S_C         = 0x02,  // J1772 C: charging                          -> Charging
+  JB_S_D         = 0x05,  // J1772 D: charging, ventilation required    -> Error (+$WR -> state 4)
+  JB_S_B         = 0x11,  // J1772 B: vehicle connected, not charging   -> Connected
+  JB_S_PRECHARGE = 0x21,  // legacy static-RE code, unseen on HW        -> Charging (defensive)
+  JB_S_CHARGING  = 0x31,  // legacy static-RE code, unseen on HW        -> Charging (defensive)
 };
 
 // Split a frame body (everything AFTER the leading '$') into type + payload.
