@@ -37,6 +37,10 @@ public:
   int  getTemperature() const override { return _status.temp; }
   bool isTemperatureValid() const override { return _status.valid; }
   int  getEvseState() const override { return _status.state; }
+  // Controller identity captured from the ATmega's $FW/$HW/$PV handshake replies.
+  const char *getControllerFirmware() const override { return _fw; }
+  const char *getControllerHardware() const override { return _hw; }
+  const char *getControllerProtocol() const override { return _pv; }
   void addStatusFields(JsonDocument &doc) const override;
 
 private:

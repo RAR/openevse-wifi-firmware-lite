@@ -615,8 +615,18 @@ void web_server_lite_build_status(JsonDocument &doc)
     doc["manual"] = manual.isActive() ? 1 : 0;
   }
 
-  // Identity / system.
-  doc["firmware"]  = LITE_FW_VERSION;
+  // Identity / system. "version" = WiFi gateway (this lite fw); "firmware" = the EVSE
+  // controller (ATmega), read from its $FW handshake reply (fallback label until captured).
+  {
+    const char *cfw = s_mgr_ctrl ? s_mgr_ctrl->getControllerFirmware() : "";
+    doc["firmware"] = (cfw && cfw[0]) ? cfw : "JuiceBox (ATmega)";
+    if (s_mgr_ctrl) {
+      const char *chw = s_mgr_ctrl->getControllerHardware();
+      const char *cpv = s_mgr_ctrl->getControllerProtocol();
+      if (chw && chw[0]) doc["controller_hw"]    = chw;   // $HW reply (diagnostic)
+      if (cpv && cpv[0]) doc["controller_proto"] = cpv;   // $PV reply (diagnostic)
+    }
+  }
   doc["version"]   = LITE_FW_VERSION;
   doc["ota_bank"]  = lt_ota_dual_get_current();   // 1 = bank A (@0x008000), 2 = bank B (@0x100000)
   { IPAddress ip = WiFi.localIP();
@@ -868,11 +878,14 @@ static void config_json(String &out)
   doc["rfid_storage"]   = s_rfidCfg.allowlist;   // gui contract (comma-separated tag list)
   doc["rfid_allowlist"] = s_rfidCfg.allowlist;   // legacy alias
   doc["wizard_passed"] = s_wizardPassed;   // first-run gate; App.svelte shows the wizard until true
-  // Firmware versions for the UI's About/Firmware pages, which read them from
-  // /config (not /status): "version" = WiFi gateway (this lite fw), "firmware" =
-  // EVSE controller. lite has no validated controller-fw read, so both report
-  // LITE_FW_VERSION (matches /status). GUI version is the UI's build-time const.
-  doc["firmware"] = LITE_FW_VERSION;
+  // Firmware versions for the UI's About/Firmware pages, which read them from /config
+  // (not /status): "version" = WiFi gateway (this lite fw); "firmware" = the EVSE
+  // controller (ATmega), read from its $FW handshake reply (fallback label until
+  // captured). GUI's own version is the UI's build-time const.
+  {
+    const char *cfw = s_mgr_ctrl ? s_mgr_ctrl->getControllerFirmware() : "";
+    doc["firmware"] = (cfw && cfw[0]) ? cfw : "JuiceBox (ATmega)";
+  }
   doc["version"]  = LITE_FW_VERSION;
   doc["ssid"]     = WiFi.SSID();   // UI Network card SSID row reads config.ssid
   // Time settings (UI Time page reads these from /config).

@@ -40,6 +40,9 @@ public:
   int  getMinCurrent() const         { return _backend.getMinCurrent(); }
   int  getMaxHardwareCurrent() const { return _backend.getMaxHardwareCurrent(); }
   int  getEvseState() const          { return _backend.getEvseState(); }
+  const char *getControllerFirmware() const { return _backend.getControllerFirmware(); }
+  const char *getControllerHardware() const { return _backend.getControllerHardware(); }
+  const char *getControllerProtocol() const { return _backend.getControllerProtocol(); }
   int           getPower() const       { return _backend.getPower(); }
   LiteEvseState getDeviceState() const { return _backend.getState(); }
 

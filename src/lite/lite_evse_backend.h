@@ -33,6 +33,13 @@ public:
   virtual bool isTemperatureValid() const = 0;
   virtual int  getEvseState() const = 0;           // raw $ES S code
 
+  // EVSE-controller (MCU) identity, for the "OpenEVSE firmware" UI field. Empty when the
+  // backend has no separate controller (default); JuiceBox fills these from the ATmega's
+  // $FW/$HW/$PV handshake replies. Returned pointers must stay valid (member buffers).
+  virtual const char *getControllerFirmware() const { return ""; }
+  virtual const char *getControllerHardware() const { return ""; }
+  virtual const char *getControllerProtocol() const { return ""; }
+
   // Backend-specific extras (identity strings, raw fields, ...).
   virtual void addStatusFields(JsonDocument &doc) const = 0;
 };
